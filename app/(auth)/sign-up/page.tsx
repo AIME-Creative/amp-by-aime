@@ -384,7 +384,37 @@ function CheckoutForm({
         return
       }
 
+      // Compute the canonical plan tier label up front. We need it for
+      // BOTH paths below: the no-charge path (100%-off coupon → no
+      // PaymentIntent fires → confirmPayment skipped) AND the paid path.
+      // Without this UPDATE the trigger's default plan_tier='None' stays
+      // on the profile and middleware bounces the user to select-plan.
+      // Stripe's customer.subscription.updated webhook eventually
+      // reaffirms these values, but it can't beat the redirect.
+      const planTierLabel =
+        selectedPlan === 'vip' ? 'VIP'
+        : selectedPlan === 'elite' ? 'Elite'
+        : selectedPlan === 'premium' ? 'Premium'
+        : null
+      const writeProfileAfterCheckout = async () => {
+        if (!planTierLabel) return
+        await supabase
+          .from('profiles')
+          .update({
+            plan_tier: planTierLabel,
+            billing_period: billingInterval,
+            subscription_status: 'active',
+            stripe_subscription_status: 'active',
+          })
+          .eq('id', userId)
+      }
+
       if (!checkoutData.clientSecret) {
+        // 100%-off coupon path — Stripe doesn't issue a PaymentIntent
+        // because there's nothing to charge. The subscription is
+        // already active on Stripe's side; we just need to mirror that
+        // to our profile before redirecting.
+        await writeProfileAfterCheckout()
         window.location.href = '/onboarding/claim-fuse-ticket'
         return
       }
@@ -420,34 +450,7 @@ function CheckoutForm({
         return
       }
 
-      // The Stripe webhook canonical-sets plan_tier / billing_period
-      // from the customer.subscription.created event, but that's async
-      // and the user is about to redirect into the Fuse wedge which
-      // gates on those values. Set them directly here so the wedge
-      // gets the right eligibility on first render. The webhook will
-      // re-affirm later and the values are idempotent.
-      const planTierLabel =
-        selectedPlan === 'vip' ? 'VIP'
-        : selectedPlan === 'elite' ? 'Elite'
-        : selectedPlan === 'premium' ? 'Premium'
-        : null
-      if (planTierLabel) {
-        // Write subscription_status alongside tier/period to close the
-        // race between payment success and the Stripe webhook. Without
-        // this, middleware reads subscription_status=null on the next
-        // request and bounces the user to /dashboard/select-plan. The
-        // customer.subscription.created webhook reaffirms the value
-        // seconds later (idempotent).
-        await supabase
-          .from('profiles')
-          .update({
-            plan_tier: planTierLabel,
-            billing_period: billingInterval,
-            subscription_status: 'active',
-            stripe_subscription_status: 'active',
-          })
-          .eq('id', userId)
-      }
+      await writeProfileAfterCheckout()
 
       window.location.href = '/onboarding/claim-fuse-ticket'
     } catch (err: any) {
