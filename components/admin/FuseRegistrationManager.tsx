@@ -124,7 +124,9 @@ export function FuseRegistrationManager({
     })
   }
 
-  // Compute ticket counts across all registrations + guests (for current page/filters)
+  // Compute ticket counts across all registrations + guests (for current page/filters).
+  // Per-guest add-on flags are tallied alongside main-attendee flags so
+  // each chip in the summary header reflects the full attendee count.
   const ticketCounts = React.useMemo(() => {
     const counts = {
       total: 0,
@@ -134,6 +136,8 @@ export function FuseRegistrationManager({
       guests: 0,
       hallOfAime: 0,
       wmnAtFuse: 0,
+      vettedVa: 0,
+      vipLuncheon: 0,
     }
     for (const reg of registrations) {
       counts.total++
@@ -141,6 +145,8 @@ export function FuseRegistrationManager({
       else if (reg.ticket_type === 'vip') counts.vip++
       if (reg.has_hall_of_aime) counts.hallOfAime++
       if (reg.has_wmn_at_fuse) counts.wmnAtFuse++
+      if ((reg as any).has_vetted_va) counts.vettedVa++
+      if ((reg as any).has_vip_luncheon) counts.vipLuncheon++
       if (reg.guests) {
         for (const guest of reg.guests) {
           counts.total++
@@ -148,6 +154,11 @@ export function FuseRegistrationManager({
           if (guest.ticket_type === 'general_admission') counts.ga++
           else if (guest.ticket_type === 'vip') counts.vip++
           else if (guest.ticket_type === 'vip_guest') counts.vip++ // VIP guest counts as VIP for check-in
+          const g = guest as any
+          if (g.has_hall_of_aime) counts.hallOfAime++
+          if (g.has_wmn_at_fuse) counts.wmnAtFuse++
+          if (g.has_vetted_va) counts.vettedVa++
+          if (g.has_vip_luncheon) counts.vipLuncheon++
         }
       }
     }
@@ -374,6 +385,9 @@ export function FuseRegistrationManager({
     has_vip_luncheon: false,
     notes: '',
     guests: [] as GuestRow[],
+    // Admin override — when true, bypasses the server-side eligibility
+    // gate (e.g. lets a monthly member be marked 'claimed' for a comp).
+    skip_eligibility_check: false,
   })
 
   // Fetch registrations when filters change
@@ -446,6 +460,7 @@ export function FuseRegistrationManager({
               has_vip_luncheon: !!(g as any).has_vip_luncheon,
             }),
           ) || [],
+        skip_eligibility_check: false,
       })
     } else {
       setEditingRegistration(null)
@@ -466,6 +481,7 @@ export function FuseRegistrationManager({
         has_vip_luncheon: false,
         notes: '',
         guests: [],
+        skip_eligibility_check: false,
       })
     }
     setIsDialogOpen(true)
@@ -795,10 +811,16 @@ export function FuseRegistrationManager({
               {ticketCounts.guests} guests
             </span>
             {ticketCounts.hallOfAime > 0 && (
-              <Badge className="bg-amber-100 text-amber-800">{ticketCounts.hallOfAime} Hall of Aime</Badge>
+              <Badge className="bg-amber-100 text-amber-800">{ticketCounts.hallOfAime} Hall of AIME</Badge>
             )}
             {ticketCounts.wmnAtFuse > 0 && (
               <Badge className="bg-pink-100 text-pink-800">{ticketCounts.wmnAtFuse} WMN</Badge>
+            )}
+            {ticketCounts.vettedVa > 0 && (
+              <Badge className="bg-emerald-100 text-emerald-800">{ticketCounts.vettedVa} Vetted VA</Badge>
+            )}
+            {ticketCounts.vipLuncheon > 0 && (
+              <Badge className="bg-purple-100 text-purple-800">{ticketCounts.vipLuncheon} VIP Luncheon</Badge>
             )}
           </div>
         </div>
@@ -885,12 +907,21 @@ export function FuseRegistrationManager({
                       <td className="px-6 py-4 whitespace-nowrap">
                         <div className="flex flex-col gap-1">
                           {registration.has_hall_of_aime && (
-                            <Badge className="bg-amber-100 text-amber-800 text-xs">Hall of Aime</Badge>
+                            <Badge className="bg-amber-100 text-amber-800 text-xs">Hall of AIME</Badge>
                           )}
                           {registration.has_wmn_at_fuse && (
                             <Badge className="bg-pink-100 text-pink-800 text-xs">WMN at Fuse</Badge>
                           )}
-                          {!registration.has_hall_of_aime && !registration.has_wmn_at_fuse && (
+                          {(registration as any).has_vetted_va && (
+                            <Badge className="bg-emerald-100 text-emerald-800 text-xs">Vetted VA</Badge>
+                          )}
+                          {(registration as any).has_vip_luncheon && (
+                            <Badge className="bg-purple-100 text-purple-800 text-xs">VIP Luncheon</Badge>
+                          )}
+                          {!registration.has_hall_of_aime &&
+                            !registration.has_wmn_at_fuse &&
+                            !(registration as any).has_vetted_va &&
+                            !(registration as any).has_vip_luncheon && (
                             <span className="text-sm text-gray-400">-</span>
                           )}
                         </div>
@@ -1236,6 +1267,27 @@ export function FuseRegistrationManager({
                     </SelectContent>
                   </Select>
                 </div>
+              </div>
+
+              {/* Eligibility override — admin escape hatch for comp tickets,
+                  legacy fixes, etc. Defaults off; API enforces normally. */}
+              <div className="mt-4 flex items-start justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 p-3">
+                <div>
+                  <Label htmlFor="skip_eligibility_check" className="text-sm font-semibold text-amber-900">
+                    Override eligibility check
+                  </Label>
+                  <p className="text-xs text-amber-700 mt-0.5">
+                    Lets you mark a non-annual member as claimed (comp tickets,
+                    sponsor seats, etc.). API gating is bypassed when on.
+                  </p>
+                </div>
+                <Switch
+                  id="skip_eligibility_check"
+                  checked={formData.skip_eligibility_check}
+                  onCheckedChange={(checked) =>
+                    setFormData({ ...formData, skip_eligibility_check: checked })
+                  }
+                />
               </div>
 
               {editingRegistration && (
