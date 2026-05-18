@@ -103,7 +103,10 @@ export default async function FuseRegistrationPage() {
         company: profile.company ?? null,
         ticket_type: 'general_admission',
         tier: profile.plan_tier,
-        purchase_type: 'purchased',
+        // Auto-created reservation for monthly buyers — no payment has
+        // happened yet, so the row stays 'pending' until the finalize
+        // route or the Stripe webhook flips it to 'purchased'.
+        purchase_type: 'pending',
         step_completed: 'claim',
         registration_source: 'dashboard_buy',
       })

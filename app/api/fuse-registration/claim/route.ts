@@ -423,7 +423,11 @@ export async function POST(request: NextRequest) {
         tier: ['Premium', 'Elite', 'VIP'].includes(profile.plan_tier as string)
           ? profile.plan_tier
           : null,
-        purchase_type: isFreeClaim ? 'claimed' : 'purchased',
+        purchase_type: isFreeClaim
+          ? 'claimed'
+          : step === 'finalize'
+          ? 'purchased'
+          : 'pending',
         has_hall_of_aime: insertHoa,
         has_wmn_at_fuse: insertWmn,
         has_vetted_va: insertVettedVa,
@@ -518,7 +522,11 @@ export async function POST(request: NextRequest) {
           tier: ['Premium', 'Elite', 'VIP'].includes(profile.plan_tier as string)
             ? profile.plan_tier
             : null,
-          purchase_type: isFreeClaim ? 'claimed' : 'purchased',
+          purchase_type: isFreeClaim
+          ? 'claimed'
+          : step === 'finalize'
+          ? 'purchased'
+          : 'pending',
           has_hall_of_aime: insertHoa,
           has_wmn_at_fuse: insertWmn,
           has_vetted_va: insertVettedVa,
