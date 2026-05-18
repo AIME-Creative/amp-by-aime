@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js'
 import Stripe from 'stripe'
 import { getBasePlanEscalations } from '@/lib/escalations'
 import { parseFullName, combineNames } from '@/lib/utils/name-parser'
+import { resolveSubscriptionFields } from '@/lib/stripe/resolve-billing-period'
 
 // Lazy initialization to avoid build-time errors
 function getSupabaseAdmin() {
@@ -325,6 +326,15 @@ export async function POST(request: NextRequest) {
           // Get escalations for the new plan tier
           const newEscalations = getBasePlanEscalations(planTier)
 
+          // Resolve billing_period + payment_amount from Stripe so the
+          // profile lands with both populated. Without this they stay
+          // null until the user opens billing-info or the 4-hour cron
+          // happens to repair them — which it often can't if the price
+          // isn't in subscription_plans.
+          const { billingPeriod, paymentAmount } = session.subscription
+            ? await resolveSubscriptionFields(supabaseAdmin, session.subscription as string)
+            : { billingPeriod: null, paymentAmount: null }
+
           // Update user's plan in database with escalations
           await supabaseAdmin
             .from('profiles')
@@ -334,6 +344,8 @@ export async function POST(request: NextRequest) {
               stripe_subscription_id: session.subscription as string,
               subscription_status: 'active',
               stripe_subscription_status: 'active',
+              billing_period: billingPeriod,
+              payment_amount: paymentAmount,
               escalations_remaining: newEscalations,
               escalations_last_reset_date: new Date().toISOString(),
               updated_at: new Date().toISOString(),
@@ -396,10 +408,19 @@ export async function POST(request: NextRequest) {
             }
           }
 
+          // Resolve billing_period + payment_amount so renewals,
+          // upgrades, and downgrades all reconcile these fields.
+          const { billingPeriod, paymentAmount } = await resolveSubscriptionFields(
+            supabaseAdmin,
+            subscription,
+          )
+
           // Check if this is a scheduled downgrade taking effect
           const updateData: Record<string, any> = {
             subscription_status: subscription.status,
             stripe_subscription_status: subscription.status,
+            billing_period: billingPeriod,
+            payment_amount: paymentAmount,
             updated_at: new Date().toISOString(),
           }
 
@@ -547,6 +568,10 @@ export async function POST(request: NextRequest) {
 
               // Update profile with new subscription, tier, and reset escalations
               const newEscalations = getBasePlanEscalations(targetTier)
+              const { billingPeriod, paymentAmount } = await resolveSubscriptionFields(
+                supabaseAdmin,
+                newSubscription,
+              )
               await supabaseAdmin
                 .from('profiles')
                 .update({
@@ -554,6 +579,8 @@ export async function POST(request: NextRequest) {
                   stripe_subscription_id: newSubscription.id,
                   subscription_status: newSubscription.status,
                   stripe_subscription_status: newSubscription.status,
+                  billing_period: billingPeriod,
+                  payment_amount: paymentAmount,
                   escalations_remaining: newEscalations,
                   escalations_last_reset_date: new Date().toISOString(),
                   pending_plan_tier: null,
@@ -572,6 +599,8 @@ export async function POST(request: NextRequest) {
                   stripe_subscription_id: null,
                   subscription_status: 'canceled',
                   stripe_subscription_status: 'canceled',
+                  billing_period: null,
+                  payment_amount: null,
                   pending_plan_tier: null,
                   pending_plan_effective_date: null,
                   pending_plan_price_id: null,
@@ -630,6 +659,10 @@ export async function POST(request: NextRequest) {
               }
 
               const newEscalations = getBasePlanEscalations(newPlanTier)
+              const { billingPeriod, paymentAmount } = await resolveSubscriptionFields(
+                supabaseAdmin,
+                activeSubscription,
+              )
 
               await supabaseAdmin
                 .from('profiles')
@@ -638,6 +671,8 @@ export async function POST(request: NextRequest) {
                   stripe_subscription_id: activeSubscription.id,
                   subscription_status: activeSubscription.status,
                   stripe_subscription_status: activeSubscription.status,
+                  billing_period: billingPeriod,
+                  payment_amount: paymentAmount,
                   escalations_remaining: newEscalations,
                   escalations_last_reset_date: new Date().toISOString(),
                   pending_plan_tier: null,
@@ -657,6 +692,8 @@ export async function POST(request: NextRequest) {
                   stripe_subscription_id: null,
                   subscription_status: 'canceled',
                   stripe_subscription_status: 'canceled',
+                  billing_period: null,
+                  payment_amount: null,
                   escalations_remaining: 0,
                   pending_plan_tier: null,
                   pending_plan_effective_date: null,
