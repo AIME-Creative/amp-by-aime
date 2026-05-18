@@ -250,6 +250,32 @@ export function FuseClaimPage({
     }
   }
 
+  // Monthly buyer reservation: same endpoint as the annual claim, but
+  // the server writes purchase_type='pending' for non-free-claim members.
+  // After success the page reloads into the Step2 checkout surface.
+  const handleStartBuyerCheckout = async () => {
+    setIsSubmitting(true)
+    try {
+      const response = await fetch('/api/fuse-registration/claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fuse_event_id: event.id,
+          step: 'claim',
+          ticket_type: 'general_admission',
+        }),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Failed to reserve ticket')
+
+      router.refresh()
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to reserve ticket')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
   const dateRange = formatDateRange()
 
   // Input styles
@@ -333,10 +359,47 @@ export function FuseClaimPage({
                 inputStyle={inputStyle}
                 labelStyle={labelStyle}
               />
+            ) : fuseEligibility.kind === 'buy' ? (
+              /* Monthly buyer landing CTA. Reservation row is created on
+                 click — page used to insert it on view, which polluted
+                 the fuse_registrations table. */
+              <div className="text-center py-4">
+                <div
+                  className="mb-4 rounded-lg px-4 py-2 text-sm inline-block"
+                  style={{ background: '#D4A85A22', border: '1px solid #D4A85A44', color: '#F4E6CA' }}
+                >
+                  Your {fuseEligibility.planTier} plan doesn't include a free Fuse ticket. Reserve a{' '}
+                  <strong style={{ color: '#ffffff' }}>General Admission</strong> ticket to continue to checkout.
+                </div>
+
+                <div className="flex justify-center">
+                  <button
+                    onClick={handleStartBuyerCheckout}
+                    disabled={isSubmitting}
+                    className="px-8 py-3 font-semibold text-sm rounded-full transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                    style={{
+                      background: '#ffffff',
+                      color: '#202F60',
+                      boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+                      letterSpacing: '0.05em',
+                      cursor: isSubmitting ? 'wait' : 'pointer',
+                    }}
+                    onMouseEnter={(e) => !isSubmitting && (e.currentTarget.style.background = '#F4E6CA')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = '#ffffff')}
+                  >
+                    {isSubmitting ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Reserving…
+                      </span>
+                    ) : (
+                      'Reserve GA — Continue to Checkout'
+                    )}
+                  </button>
+                </div>
+              </div>
             ) : (
-              /* Annual-claim landing CTA. Monthly buyers never see this
-                 — they're auto-reserved at the page level and routed
-                 directly to Step2. */
+              /* Annual-claim landing CTA (and admin test). */
               <div className="text-center py-4">
                 {effectiveTierInclusion && (
                   <div className="mb-4 rounded-lg px-4 py-2 text-sm inline-block"

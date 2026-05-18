@@ -87,35 +87,10 @@ export default async function FuseRegistrationPage() {
     .eq('user_id', effectiveUserId)
     .single()
 
-  // Monthly buyer with no registration yet: auto-create a default GA
-  // reservation so they land directly on the unified checkout instead
-  // of a separate ticket-picker landing card. They can swap to GA Plus
-  // inline via the "Add Upgrade to Order" card.
-  if (!existingRegistration && eligibility.kind === 'buy') {
-    const { data: created } = await supabase
-      .from('fuse_registrations')
-      .insert({
-        fuse_event_id: activeEvent.id,
-        user_id: effectiveUserId,
-        full_name: profile.full_name ?? '',
-        email: profile.email,
-        phone: profile.phone ?? null,
-        company: profile.company ?? null,
-        ticket_type: 'general_admission',
-        tier: profile.plan_tier,
-        // Auto-created reservation for monthly buyers — no payment has
-        // happened yet, so the row stays 'pending' until the finalize
-        // route or the Stripe webhook flips it to 'purchased'.
-        purchase_type: 'pending',
-        step_completed: 'claim',
-        registration_source: 'dashboard_buy',
-      })
-      .select(
-        'id, ticket_type, purchase_type, has_hall_of_aime, has_wmn_at_fuse, has_vetted_va, has_vip_luncheon, step_completed, guests:fuse_registration_guests(id, full_name, ticket_type, is_included, has_hall_of_aime, has_wmn_at_fuse, has_vetted_va, has_vip_luncheon)',
-      )
-      .single()
-    existingRegistration = created
-  }
+  // Monthly buyers used to get a reservation row inserted here on page
+  // view, which polluted fuse_registrations with rows for anyone who
+  // merely opened the page. The buyer CTA on the landing card now
+  // creates the row on first deliberate click.
 
   // Fetch tier-specific prices + universal add-ons (tier IS NULL, like WMN)
   const effectiveTier = profile.plan_tier && eligibleTiers.includes(profile.plan_tier)
