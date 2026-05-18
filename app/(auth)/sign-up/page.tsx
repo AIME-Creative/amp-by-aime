@@ -432,11 +432,19 @@ function CheckoutForm({
         : selectedPlan === 'premium' ? 'Premium'
         : null
       if (planTierLabel) {
+        // Write subscription_status alongside tier/period to close the
+        // race between payment success and the Stripe webhook. Without
+        // this, middleware reads subscription_status=null on the next
+        // request and bounces the user to /dashboard/select-plan. The
+        // customer.subscription.created webhook reaffirms the value
+        // seconds later (idempotent).
         await supabase
           .from('profiles')
           .update({
             plan_tier: planTierLabel,
             billing_period: billingInterval,
+            subscription_status: 'active',
+            stripe_subscription_status: 'active',
           })
           .eq('id', userId)
       }
