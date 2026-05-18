@@ -15,6 +15,10 @@ import {
 
 interface MobileNavProps {
   userRole?: string
+  fuseActiveEventYear?: number
+  fuseActiveEventEndDate?: string | null
+  fuseTicketClaimedYear?: number | null
+  fuseVisible?: boolean
 }
 
 const navItems = [
@@ -31,7 +35,13 @@ const navItems = [
 // Navigation items visible to partner vendors and lenders
 const PARTNER_NAV_ITEMS = ['Resources', 'Lenders', 'Market']
 
-export default function MobileNav({ userRole }: MobileNavProps) {
+export default function MobileNav({
+  userRole,
+  fuseActiveEventYear,
+  fuseActiveEventEndDate,
+  fuseTicketClaimedYear,
+  fuseVisible = true,
+}: MobileNavProps) {
   const pathname = usePathname()
 
   // Check if user is a partner (vendor or lender)
@@ -42,9 +52,40 @@ export default function MobileNav({ userRole }: MobileNavProps) {
     ? navItems.filter(item => PARTNER_NAV_ITEMS.includes(item.name))
     : navItems
 
+  const hasClaimed =
+    !!fuseActiveEventYear &&
+    fuseTicketClaimedYear === fuseActiveEventYear
+  const showFuseLink =
+    !isPartner &&
+    fuseVisible &&
+    hasClaimed &&
+    !!fuseActiveEventEndDate &&
+    new Date() <= new Date(`${fuseActiveEventEndDate}T23:59:59`)
+  const fuseLinkActive = pathname === '/dashboard/fuse-registration'
+  const colCount = isPartner ? 3 : (showFuseLink ? 9 : 8)
+
   return (
     <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-[#25314e] border-t border-white/10 z-50">
-      <div className={`grid ${isPartner ? 'grid-cols-3' : 'grid-cols-8'} h-16`}>
+      <div className={`grid grid-cols-${colCount} h-16`} style={{ gridTemplateColumns: `repeat(${colCount}, minmax(0, 1fr))` }}>
+        {showFuseLink && (
+          <Link
+            href="/dashboard/fuse-registration"
+            className={`flex flex-col items-center justify-center gap-1 transition-colors ${
+              fuseLinkActive ? 'ring-2 ring-[#202F60] ring-inset' : ''
+            }`}
+            style={{ background: '#ffffff' }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src="/assets/fuse/fuse-logo.png"
+              alt=""
+              className="h-5 w-auto"
+            />
+            <span className="text-[9px] font-bold uppercase tracking-wide" style={{ color: '#202F60' }}>
+              {fuseActiveEventYear ? `Fuse ${fuseActiveEventYear}` : 'Fuse'}
+            </span>
+          </Link>
+        )}
         {filteredNavItems.map((item) => {
           const Icon = item.icon
           const isActive = pathname === item.href

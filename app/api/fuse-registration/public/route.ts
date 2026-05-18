@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import Stripe from 'stripe'
+import { pickActivePrice } from '@/lib/fuse/pricing'
+import { isFuseLive } from '@/lib/fuse/visibility'
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -11,6 +13,12 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!)
 
 export async function POST(request: NextRequest) {
   try {
+    // Pre-go-live: public Fuse purchases are not yet available.
+    // 404 (not 403) so we don't leak that the endpoint exists.
+    if (!isFuseLive()) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+
     const body = await request.json()
     const {
       fuse_event_id,
@@ -43,6 +51,15 @@ export async function POST(request: NextRequest) {
     }
     if (!ticket_type) {
       return NextResponse.json({ error: 'Ticket type required' }, { status: 400 })
+    }
+
+    // VIP tickets are claimable by VIP members only; the public flow has
+    // no member context, so VIP is never sellable here.
+    if (ticket_type === 'vip') {
+      return NextResponse.json(
+        { error: 'VIP tickets are reserved for VIP members and cannot be purchased here.' },
+        { status: 403 },
+      )
     }
 
     // Verify event exists and is active
@@ -84,32 +101,9 @@ export async function POST(request: NextRequest) {
       .is('tier', null)
       .eq('is_active', true)
 
-    // Determine active GA price (early bird vs regular)
-    const now = new Date()
-    const earlyBirdGA = allPrices?.find(
-      (p) => p.product_key === 'ga' && p.pricing_phase === 'early_bird'
-    )
-    const regularGA = allPrices?.find(
-      (p) => p.product_key === 'ga' && p.pricing_phase === 'regular'
-    )
-
-    let isEarlyBird = false
-    if (earlyBirdGA) {
-      const start = earlyBirdGA.phase_start_at ? new Date(earlyBirdGA.phase_start_at) : null
-      const end = earlyBirdGA.phase_end_at ? new Date(earlyBirdGA.phase_end_at) : null
-      if (!start && !end) {
-        isEarlyBird = true
-      } else if (start && end) {
-        isEarlyBird = now >= start && now <= end
-      } else if (start && !end) {
-        isEarlyBird = now >= start
-      } else if (!start && end) {
-        isEarlyBird = now <= end
-      }
-    }
-
-    const activeGA = isEarlyBird && earlyBirdGA ? earlyBirdGA : regularGA
-    const hoaPrice = allPrices?.find((p) => p.product_key === 'hoa')
+    // Phase-aware lookup: returns the active row given the current time.
+    const activeGA = pickActivePrice(allPrices, 'ga', null)
+    const hoaPrice = pickActivePrice(allPrices, 'hoa', null)
 
     const fullName = `${first_name} ${last_name}`.trim()
 

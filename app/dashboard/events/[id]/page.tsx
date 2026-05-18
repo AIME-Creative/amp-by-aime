@@ -69,13 +69,40 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
   const { data: { user } } = await supabase.auth.getUser()
   let { data: profile } = await supabase
     .from('profiles')
-    .select('role, plan_tier, is_admin')
+    .select('role, plan_tier, billing_period, is_admin, fuse_ticket_claimed_year')
     .eq('id', user?.id)
     .single()
 
   // Apply view-as override if active
   const viewAsSettings = await getViewAsSettings()
   profile = applyViewAsOverride(profile, viewAsSettings)
+
+  // Detect whether this event row corresponds to the active Fuse event so
+  // we can surface a "Claim Your Ticket" CTA. Match by title containing
+  // "Fuse" + the active fuse year present in the title or start date.
+  const { data: activeFuseEvent } = await supabase
+    .from('fuse_events')
+    .select('year, name')
+    .eq('is_active', true)
+    .single()
+
+  const titleLower = (eventData.title || '').toLowerCase()
+  const isFuseEvent =
+    !!activeFuseEvent &&
+    titleLower.includes('fuse') &&
+    (titleLower.includes(String(activeFuseEvent.year)) ||
+      titleLower.includes((activeFuseEvent.name || '').toLowerCase()))
+
+  const eligibleTiers = ['Premium', 'Elite', 'VIP']
+  const fuseEligible =
+    !!isFuseEvent &&
+    (profile?.is_admin === true ||
+      (!!profile?.plan_tier &&
+        eligibleTiers.includes(profile.plan_tier) &&
+        (profile?.billing_period ?? '').toLowerCase() === 'annual'))
+  const fuseClaimed =
+    !!activeFuseEvent &&
+    profile?.fuse_ticket_claimed_year === activeFuseEvent.year
 
   if (error || !eventData) {
     notFound()
@@ -186,6 +213,67 @@ export default async function EventDetailPage({ params }: EventDetailPageProps) 
           <span className="text-sm font-medium">Back to events</span>
         </Link>
       </div>
+
+      {/* Fuse claim CTA: shows for eligible members who haven't claimed yet.
+          Matches the Fuse banner / claim card brand: navy bg, white pill,
+          cream text. */}
+      {isFuseEvent && fuseEligible && !fuseClaimed && (
+        <div className="px-4 md:px-8 pb-4">
+          <div
+            className="rounded-lg p-4 md:p-5 flex flex-col md:flex-row md:items-center md:justify-between gap-3"
+            style={{ background: '#202F60', border: '1px solid #D4A85A33' }}
+          >
+            <div className="flex items-center gap-3">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src="/assets/fuse/fuse-logo.png"
+                alt=""
+                className="h-10 w-auto"
+              />
+              <div>
+                <div className="font-bold text-sm" style={{ color: '#F4E6CA' }}>
+                  Your membership includes a Fuse ticket
+                </div>
+                <div className="text-xs" style={{ color: '#D4A85A' }}>
+                  Claim it now and add guests or add-ons later.
+                </div>
+              </div>
+            </div>
+            <Link
+              href="/dashboard/fuse-registration"
+              className="font-semibold text-sm px-5 py-2 rounded-full transition-all hover:bg-[#F4E6CA] whitespace-nowrap text-center"
+              style={{
+                background: '#ffffff',
+                color: '#202F60',
+                boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
+              }}
+            >
+              Claim Your Ticket
+            </Link>
+          </div>
+        </div>
+      )}
+
+      {/* "You're registered" callout when they've already claimed */}
+      {isFuseEvent && fuseClaimed && (
+        <div className="px-4 md:px-8 pb-4">
+          <div
+            className="rounded-lg p-4 flex items-center justify-between gap-3"
+            style={{ background: '#3a5a2022', border: '1px solid #3a5a2055' }}
+          >
+            <div className="text-sm font-semibold" style={{ color: '#3a5a20' }}>
+              You&apos;re registered for Fuse 2026.
+            </div>
+            <Link
+              href="/dashboard/fuse-registration"
+              className="text-sm underline"
+              style={{ color: '#202F60' }}
+            >
+              Manage registration
+            </Link>
+          </div>
+        </div>
+      )}
 
       {/* Event Header */}
       <div className="px-4 md:px-8 pb-6">

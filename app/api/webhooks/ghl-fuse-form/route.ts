@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { ghlClient } from '@/lib/ghl/client'
+import { dropFuseRegistration } from '@/lib/fuse/ghl-drop'
 
 // Use service role for webhook operations
 function getSupabaseAdmin() {
@@ -49,15 +50,15 @@ export async function POST(request: NextRequest) {
     const phone = body.phone
     const company = body.company || body.company_name
 
-    // Normalize ticket type
+    // Normalize ticket type. GA Plus was retired for Fuse 2026, so any
+    // "GA Plus" coming in from a stale form payload is downgraded to GA.
     let ticketType = 'general_admission'
     if (body.ticket_type) {
       const rawType = body.ticket_type.toLowerCase().replace(/[^a-z]/g, '')
       if (rawType.includes('vip')) {
         ticketType = 'vip'
-      } else if (rawType.includes('plus') || rawType.includes('ga+')) {
-        ticketType = 'general_admission_plus'
       }
+      // Plus / GA+ → general_admission (silently downgraded)
     }
 
     // Get add-on flags
@@ -200,6 +201,46 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // Fire Fuse confirmation workflow + opportunity webhook — but only
+    // for member claims. Non-member 'purchased' rows from this path are
+    // marketing-owned upstream; we don't push anything until we know the
+    // payment-trust story (see plan Pending #2).
+    if (purchaseType === 'claimed') {
+      try {
+        await dropFuseRegistration({
+          registration_id: registration.id,
+          fuse_event_id: activeEvent.id,
+          fuse_event_year: activeEvent.year,
+          ghl_contact_id: contactId ?? null,
+          full_name: fullName,
+          email,
+          phone: phone || null,
+          company: company || null,
+          nmls_number: null,
+          plan_tier: memberProfile?.plan_tier ?? null,
+          billing_period: null,
+          ticket_type: ticketType,
+          tier,
+          purchase_type: purchaseType,
+          has_hall_of_aime: hasHallOfAime,
+          has_wmn_at_fuse: hasWmnAtFuse,
+          has_vetted_va: false,
+          has_vip_luncheon: false,
+          guests: guestNames.map((name, i) => ({
+            full_name: name,
+            ticket_type: normalizeGuestTicketType(guestTicketTypes[i]),
+            is_included: ticketType === 'vip' && i === 0,
+          })),
+          pricing_phase: null,
+          total_paid_cents: 0,
+          invoice_number: null,
+          created_at: new Date().toISOString(),
+        })
+      } catch (dropErr) {
+        console.error('Fuse GHL drop failed (non-fatal):', dropErr)
+      }
+    }
+
     return NextResponse.json({
       success: true,
       registration_id: registration.id,
@@ -232,8 +273,6 @@ function normalizeGuestTicketType(type?: string): string {
   if (normalized.includes('vip')) {
     return 'vip'
   }
-  if (normalized.includes('plus') || normalized.includes('ga+')) {
-    return 'general_admission_plus'
-  }
+  // GA Plus retired for Fuse 2026 — any "plus" / "ga+" downgrades to GA.
   return 'general_admission'
 }

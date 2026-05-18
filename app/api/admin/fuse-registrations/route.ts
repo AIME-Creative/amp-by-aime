@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import type { FuseRegistration } from '@/types/database.types'
+import { getFuseEligibility } from '@/lib/fuse/eligibility'
+
+// Allowed enum values (kept in sync with DB CHECK constraints).
+const VALID_PURCHASE_TYPES = ['claimed', 'purchased', 'pending', 'upgraded'] as const
+const VALID_STEP_COMPLETED = ['claim', 'finalized'] as const
 
 // GET - List all fuse registrations with filtering and pagination
 export async function GET(request: NextRequest) {
@@ -126,6 +131,9 @@ export async function POST(request: Request) {
       purchase_type,
       has_hall_of_aime = false,
       has_wmn_at_fuse = false,
+      has_vetted_va = false,
+      has_vip_luncheon = false,
+      step_completed,
       notes,
       guests = [],
     } = body
@@ -138,23 +146,90 @@ export async function POST(request: Request) {
       )
     }
 
-    // Use explicit user_id if provided (from member picker), otherwise look up by email
-    let memberProfile: { id: string; plan_tier: string | null } | null = null
+    // Validate enum values against DB CHECK constraints. Bad values
+    // would otherwise surface as opaque DB errors.
+    if (!VALID_PURCHASE_TYPES.includes(purchase_type)) {
+      return NextResponse.json(
+        { error: `Invalid purchase_type. Must be one of: ${VALID_PURCHASE_TYPES.join(', ')}` },
+        { status: 400 },
+      )
+    }
+    // GA Plus retired for Fuse 2026 — admins can still PATCH legacy
+    // rows but not create new ones with those values.
+    if (ticket_type === 'general_admission_plus' || purchase_type === 'upgraded') {
+      return NextResponse.json(
+        { error: 'General Admission Plus / upgraded is no longer available for new Fuse 2026 registrations.' },
+        { status: 400 },
+      )
+    }
+    if (step_completed && !VALID_STEP_COMPLETED.includes(step_completed)) {
+      return NextResponse.json(
+        { error: `Invalid step_completed. Must be one of: ${VALID_STEP_COMPLETED.join(', ')}` },
+        { status: 400 },
+      )
+    }
+
+    // Use explicit user_id if provided (from member picker), otherwise
+    // look up by email. Pull billing_period too — it's needed for
+    // eligibility gating below.
+    let memberProfile:
+      | { id: string; plan_tier: string | null; billing_period: string | null }
+      | null = null
     if (body.user_id) {
       const { data: mp } = await supabase
         .from('profiles')
-        .select('id, plan_tier')
+        .select('id, plan_tier, billing_period')
         .eq('id', body.user_id)
         .single()
       memberProfile = mp
     } else {
       const { data: mp } = await supabase
         .from('profiles')
-        .select('id, plan_tier')
+        .select('id, plan_tier, billing_period')
         .eq('email', email.toLowerCase())
         .single()
       memberProfile = mp
     }
+
+    // Eligibility gating. If the registration is linked to a member,
+    // make sure the purchase_type matches what their plan actually
+    // entitles them to:
+    //   - Annual Premium/Elite/VIP → 'claimed' only
+    //   - Monthly Premium/Elite/VIP → 'purchased' or 'pending' (not VIP ticket)
+    //   - Non-eligible profile → 'purchased' / 'pending' only (no claim)
+    // Admins can explicitly override by passing `skip_eligibility_check: true`
+    // if they need to fix legacy data.
+    if (memberProfile && !body.skip_eligibility_check) {
+      const eligibility = getFuseEligibility(
+        memberProfile.plan_tier,
+        memberProfile.billing_period,
+      )
+      if (purchase_type === 'claimed' && eligibility.kind !== 'claim') {
+        return NextResponse.json(
+          {
+            error:
+              "This member isn't eligible for a free claim (annual Premium/Elite/VIP only). " +
+              'Use purchase_type "purchased" or "pending" instead, or set skip_eligibility_check.',
+          },
+          { status: 400 },
+        )
+      }
+      if (ticket_type === 'vip' && !(eligibility.kind === 'claim' && eligibility.planTier === 'VIP')) {
+        return NextResponse.json(
+          { error: 'VIP tickets are reserved for annual VIP members.' },
+          { status: 400 },
+        )
+      }
+    }
+
+    // VIP membership entitlement: 2 VIP tickets + 2 Hall of AIME
+    // included. Mirror the user-facing claim route — auto-set HOA on
+    // any VIP claim regardless of whether the admin remembered to tick
+    // the box. Other purchase_types stay literal.
+    const effectiveHoa =
+      purchase_type === 'claimed' && ticket_type === 'vip'
+        ? true
+        : has_hall_of_aime
 
     // Create registration
     const { data: registration, error } = await supabase
@@ -169,8 +244,11 @@ export async function POST(request: Request) {
         ticket_type,
         tier: tier || null,
         purchase_type,
-        has_hall_of_aime,
+        has_hall_of_aime: effectiveHoa,
         has_wmn_at_fuse,
+        has_vetted_va,
+        has_vip_luncheon,
+        step_completed: step_completed || 'claim',
         registration_source: 'admin_manual',
         notes: notes || null,
         created_by: user.id,
@@ -183,7 +261,9 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Failed to create registration' }, { status: 500 })
     }
 
-    // Insert guests if any
+    // Insert guests if any. Guest add-ons are gated by what the main
+    // registration carries — a guest can't have HOA if the main doesn't.
+    // Admins can still flip them later via PATCH after editing the main.
     if (guests.length > 0) {
       const guestRecords = guests.map((guest: any) => ({
         registration_id: registration.id,
@@ -192,6 +272,10 @@ export async function POST(request: Request) {
         phone: guest.phone || null,
         ticket_type: guest.ticket_type,
         is_included: guest.is_included || false,
+        has_hall_of_aime: !!guest.has_hall_of_aime && effectiveHoa,
+        has_wmn_at_fuse: !!guest.has_wmn_at_fuse && has_wmn_at_fuse,
+        has_vetted_va: !!guest.has_vetted_va && has_vetted_va,
+        has_vip_luncheon: !!guest.has_vip_luncheon && has_vip_luncheon,
       }))
 
       const { error: guestError } = await supabase

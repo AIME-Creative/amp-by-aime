@@ -26,9 +26,12 @@ export async function GET(request: NextRequest) {
 
   const searchTerm = `%${query.toLowerCase()}%`
 
+  // billing_period is needed so the admin UI can auto-fill the right
+  // purchase_type via getFuseEligibility (annual eligible → claimed,
+  // monthly Premium/Elite/VIP → purchased/pending).
   const { data: members } = await supabase
     .from('profiles')
-    .select('id, full_name, email, phone, company, plan_tier, fuse_ticket_claimed_year')
+    .select('id, full_name, email, phone, company, plan_tier, billing_period, fuse_ticket_claimed_year')
     .or(`full_name.ilike.${searchTerm},email.ilike.${searchTerm},company.ilike.${searchTerm}`)
     .order('full_name')
     .limit(10)

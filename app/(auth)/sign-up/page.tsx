@@ -289,6 +289,9 @@ function CheckoutForm({
       }
 
       const supabase = createClient()
+      let userId: string | null = null
+      let isReturningFromFailedPayment = false
+
       const { data, error } = await supabase.auth.signUp({
         email: formData.email,
         password: formData.password,
@@ -301,33 +304,66 @@ function CheckoutForm({
         },
       })
 
-      if (error) throw error
-      if (!data.user?.id) throw new Error('Account creation failed')
+      if (error) {
+        // The auth user was created on a previous attempt but the
+        // payment didn't go through, so we orphaned an account. Try
+        // signing in with the supplied password — if it works, the
+        // user is the same person retrying, and we can continue
+        // straight into the payment step.
+        const isAlreadyRegistered =
+          error.status === 422 ||
+          /already.*registered|already.*exists/i.test(error.message)
+        if (!isAlreadyRegistered) throw error
 
-      const userId = data.user.id
+        const { data: signInData, error: signInError } =
+          await supabase.auth.signInWithPassword({
+            email: formData.email,
+            password: formData.password,
+          })
+        if (signInError || !signInData.user?.id) {
+          setPaymentError(
+            'This email already has an account. Log in to continue checkout.',
+          )
+          setIsSubmitting(false)
+          return
+        }
+        userId = signInData.user.id
+        isReturningFromFailedPayment = true
+      } else if (!data.user?.id) {
+        throw new Error('Account creation failed')
+      } else {
+        userId = data.user.id
+      }
+
       const attribution = getStoredAttribution()
 
-      try {
-        await fetch('/api/ghl/create-contact', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId,
-            email: formData.email,
-            fullName: formData.fullName,
-            phone: formData.phone,
-            role: 'loan_officer',
-            attribution,
-          }),
-        })
-      } catch (ghlError) {
-        console.error('GHL contact creation failed:', ghlError)
+      if (!isReturningFromFailedPayment) {
+        try {
+          await fetch('/api/ghl/create-contact', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId,
+              email: formData.email,
+              fullName: formData.fullName,
+              phone: formData.phone,
+              role: 'loan_officer',
+              attribution,
+            }),
+          })
+        } catch (ghlError) {
+          console.error('GHL contact creation failed:', ghlError)
+        }
       }
 
       await supabase
         .from('profiles')
         .update({
-          onboarding_step: 'complete_profile',
+          // Fuse 2026 wedge: drop into the claim/buy step between
+          // checkout and complete-profile. The wedge auto-skips
+          // ineligible users (no tier / expired event) straight to
+          // complete-profile, so this is safe for all sign-ups.
+          onboarding_step: 'claim_fuse_ticket',
           ...(attribution ? { attribution } : {}),
         })
         .eq('id', userId)
@@ -349,7 +385,7 @@ function CheckoutForm({
       }
 
       if (!checkoutData.clientSecret) {
-        window.location.href = '/onboarding/complete-profile'
+        window.location.href = '/onboarding/claim-fuse-ticket'
         return
       }
 
@@ -357,7 +393,7 @@ function CheckoutForm({
         elements,
         clientSecret: checkoutData.clientSecret,
         confirmParams: {
-          return_url: `${window.location.origin}/onboarding/complete-profile`,
+          return_url: `${window.location.origin}/onboarding/claim-fuse-ticket`,
           payment_method_data: {
             billing_details: {
               name: formData.fullName || undefined,
@@ -384,7 +420,28 @@ function CheckoutForm({
         return
       }
 
-      window.location.href = '/onboarding/complete-profile'
+      // The Stripe webhook canonical-sets plan_tier / billing_period
+      // from the customer.subscription.created event, but that's async
+      // and the user is about to redirect into the Fuse wedge which
+      // gates on those values. Set them directly here so the wedge
+      // gets the right eligibility on first render. The webhook will
+      // re-affirm later and the values are idempotent.
+      const planTierLabel =
+        selectedPlan === 'vip' ? 'VIP'
+        : selectedPlan === 'elite' ? 'Elite'
+        : selectedPlan === 'premium' ? 'Premium'
+        : null
+      if (planTierLabel) {
+        await supabase
+          .from('profiles')
+          .update({
+            plan_tier: planTierLabel,
+            billing_period: billingInterval,
+          })
+          .eq('id', userId)
+      }
+
+      window.location.href = '/onboarding/claim-fuse-ticket'
     } catch (err: any) {
       toast.error(err.message || 'Failed to create account')
       setIsSubmitting(false)

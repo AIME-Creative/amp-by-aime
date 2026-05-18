@@ -380,6 +380,37 @@ class GHLClient {
   }
 
   /**
+   * POST a Fuse registration → Opportunity payload to an AIME-owned
+   * webhook URL (env: GHL_FUSE_OPPORTUNITY_WEBHOOK_URL). The webhook
+   * receiver is responsible for creating / updating the GHL Opportunity
+   * and mapping fields to the right pipeline / stage. Our job is just to
+   * send a stable payload shape.
+   */
+  async postFuseOpportunity(payload: Record<string, unknown>): Promise<boolean> {
+    const url = process.env.GHL_FUSE_OPPORTUNITY_WEBHOOK_URL
+    if (!url) {
+      console.warn('GHL_FUSE_OPPORTUNITY_WEBHOOK_URL not configured; skipping opportunity push')
+      return false
+    }
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!response.ok) {
+        const error = await response.text()
+        console.error('Error posting Fuse opportunity webhook:', response.status, error)
+        return false
+      }
+      return true
+    } catch (error) {
+      console.error('Error posting Fuse opportunity webhook:', error)
+      return false
+    }
+  }
+
+  /**
    * Remove a tag from a contact
    */
   async removeTagFromContact(contactId: string, tag: string): Promise<boolean> {

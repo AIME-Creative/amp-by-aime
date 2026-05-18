@@ -22,10 +22,14 @@ interface DashboardLayoutProps {
   paymentFailedAt?: string | null
   subscriptionStatus?: string
   planTier?: string | null
+  billingPeriod?: string | null
   fuseTicketClaimedYear?: number | null
   fuseActiveEventYear?: number
+  fuseActiveEventEndDate?: string | null
   fuseEventName?: string
   fuseEventLocation?: string
+  /** Pre-go-live kill switch: gates all Fuse UI to admins only when false. */
+  fuseVisible?: boolean
   /** True when admin is in View As or Impersonation mode */
   isAdminPreview?: boolean
 }
@@ -38,17 +42,27 @@ export default function DashboardLayout({
   paymentFailedAt,
   subscriptionStatus,
   planTier,
+  billingPeriod,
   fuseTicketClaimedYear,
   fuseActiveEventYear,
+  fuseActiveEventEndDate,
   fuseEventName,
   fuseEventLocation,
+  fuseVisible = false,
   isAdminPreview = false,
 }: DashboardLayoutProps) {
   return (
     <div className="flex min-h-screen bg-gray-50">
       {/* Desktop Sidebar */}
       <div className="hidden md:block">
-        <Sidebar user={user} userRole={userRole} />
+        <Sidebar
+          user={user}
+          userRole={userRole}
+          fuseActiveEventYear={fuseActiveEventYear}
+          fuseActiveEventEndDate={fuseActiveEventEndDate}
+          fuseTicketClaimedYear={fuseTicketClaimedYear}
+          fuseVisible={fuseVisible}
+        />
       </div>
 
       {/* Mobile Header */}
@@ -70,15 +84,16 @@ export default function DashboardLayout({
           />
         </div>
 
-        {/* Fuse Claim Banner (shows for admins and admin preview mode) */}
+        {/* Fuse Claim Banner (eligible annual members; admins always see for testing) */}
         <FuseClaimBanner
           planTier={planTier}
+          billingPeriod={billingPeriod}
           fuseTicketClaimedYear={fuseTicketClaimedYear}
           activeEventYear={fuseActiveEventYear}
           eventName={fuseEventName}
           eventLocation={fuseEventLocation}
-          isAdminPreview={isAdminPreview}
           isAdmin={isAdmin}
+          fuseVisible={fuseVisible}
         />
 
         {/* Dashboard Header (Search, Notifications, User Actions) */}
@@ -89,7 +104,13 @@ export default function DashboardLayout({
       </main>
 
       {/* Mobile Bottom Navigation */}
-      <MobileNav userRole={userRole} />
+      <MobileNav
+        userRole={userRole}
+        fuseActiveEventYear={fuseActiveEventYear}
+        fuseActiveEventEndDate={fuseActiveEventEndDate}
+        fuseTicketClaimedYear={fuseTicketClaimedYear}
+        fuseVisible={fuseVisible}
+      />
     </div>
   )
 }
