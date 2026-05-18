@@ -1,10 +1,16 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { Loader2, CheckCircle2, ArrowLeft } from 'lucide-react'
+import { Loader2, CheckCircle2, ArrowLeft, CreditCard } from 'lucide-react'
 import { toast } from 'sonner'
 import Link from 'next/link'
+import { loadStripe } from '@stripe/stripe-js'
+import { AddCardModal } from '@/components/modals/AddCardModal'
+import { planGuestPricing, pickActivePrice } from '@/lib/fuse/pricing'
+import { getFuseEligibility } from '@/lib/fuse/eligibility'
+
+const stripePromise = loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY!)
 
 // ===== Types =====
 
@@ -27,7 +33,33 @@ interface TierPrice {
   is_addon: boolean
   is_included: boolean
   gender_lock: string | null
+  pricing_phase: string
+  tier: string | null
+  phase_end_at: string | null
   sort_order: number
+}
+
+interface AllPriceRow {
+  id: string
+  product_key: string
+  label: string
+  description: string | null
+  price: number
+  stripe_price_id: string | null
+  is_addon: boolean
+  is_included: boolean
+  gender_lock: string | null
+  pricing_phase: string
+  tier: string | null
+  phase_start_at: string | null
+  phase_end_at: string | null
+  sort_order: number
+}
+
+interface GuestPricingRule {
+  tier: string
+  base_product_key: string
+  discount_percent: number
 }
 
 interface FuseClaimPageProps {
@@ -39,16 +71,29 @@ interface FuseClaimPageProps {
     phone?: string
     company?: string
     plan_tier?: string
+    billing_period?: string
     gender?: string
   }
   existingRegistration: {
     id: string
     ticket_type: string
+    purchase_type: string
     has_hall_of_aime: boolean
     has_wmn_at_fuse: boolean
+    has_vetted_va: boolean
+    has_vip_luncheon: boolean
+    step_completed: 'claim' | 'finalized'
+    guests?: Array<{
+      id: string
+      full_name: string
+      ticket_type: string
+      is_included: boolean
+    }>
   } | null
   isAdmin: boolean
   tierPrices: TierPrice[]
+  allPrices: AllPriceRow[]
+  guestPricingRules: GuestPricingRule[]
 }
 
 const TIER_INCLUSIONS: Record<string, { ticket: string; label: string }> = {
@@ -73,9 +118,41 @@ const FUSE_ATTENDANCE_OPTIONS = [
   { value: '5+', label: '5 or more' },
 ]
 
+// General Admission Plus was removed for Fuse 2026. The label stays
+// in this lookup so legacy 'general_admission_plus' rows still render
+// readable text in the admin's manage panel, but no UI creates new
+// ones.
 const TICKET_LABELS: Record<string, string> = {
   general_admission: 'General Admission',
+  general_admission_plus: 'General Admission Plus',
   vip: 'VIP',
+}
+
+// Detect whether an addon is currently showing its early-bird price AND
+// a higher regular-phase row exists. Used to render the "$299 $199 /
+// Early-Bird until June 15" treatment.
+function getAddonSaleInfo(
+  addon: { product_key: string; tier: string | null; pricing_phase: string; price: number; phase_end_at: string | null },
+  allPrices: AllPriceRow[],
+): { regularPrice: number; earlyBirdEndAt: string | null } | null {
+  if (addon.pricing_phase !== 'early_bird') return null
+  const regularRow = allPrices.find(
+    (p) =>
+      p.product_key === addon.product_key &&
+      (p.tier ?? null) === (addon.tier ?? null) &&
+      p.pricing_phase === 'regular',
+  )
+  if (!regularRow || (regularRow.price ?? 0) <= (addon.price ?? 0)) return null
+  return {
+    regularPrice: regularRow.price ?? 0,
+    earlyBirdEndAt: addon.phase_end_at,
+  }
+}
+
+function formatSaleEndDate(iso: string | null): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return d.toLocaleDateString('en-US', { month: 'long', day: 'numeric' })
 }
 
 // ===== Component =====
@@ -86,30 +163,49 @@ export function FuseClaimPage({
   existingRegistration,
   isAdmin,
   tierPrices,
+  allPrices,
+  guestPricingRules,
 }: FuseClaimPageProps) {
   const router = useRouter()
-  const [modalOpen, setModalOpen] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  // `gender` is read-only on this surface (used by the inner panels for
+  // gender-locked add-ons). Sourced from the member's profile.
+  const gender = userProfile.gender?.toLowerCase() || ''
 
-  // Form state
-  const [firstName, setFirstName] = useState(userProfile.full_name?.split(' ')[0] || '')
-  const [lastName, setLastName] = useState(userProfile.full_name?.split(' ').slice(1).join(' ') || '')
-  const [preferredName, setPreferredName] = useState('')
-  const [phone, setPhone] = useState(userProfile.phone || '')
-  const [email, setEmail] = useState(userProfile.email || '')
-  const [company, setCompany] = useState(userProfile.company || '')
-  const [gender, setGender] = useState(userProfile.gender?.toLowerCase() || '')
-  const [fuseAttendance, setFuseAttendance] = useState('')
-  const [addonState, setAddonState] = useState<Record<string, boolean>>({})
-  const [guests, setGuests] = useState<{ id: number; firstName: string; lastName: string; email: string }[]>([])
-  const [nextGuestId, setNextGuestId] = useState(0)
-  const [marketingConsent, setMarketingConsent] = useState(false)
+  // Card-on-file + AddCardModal for the GA Plus upgrade CTA on the
+  // landing card. (Inner panels manage their own copies for their flows.)
+  const [paymentMethod, setPaymentMethod] = useState<
+    { brand: string; last4: string } | null
+  >(null)
+  const [addCardOpen, setAddCardOpen] = useState(false)
+  const loadPaymentMethod = async () => {
+    try {
+      const res = await fetch('/api/stripe/payment-method')
+      const data = await res.json()
+      setPaymentMethod(data.paymentMethod ?? null)
+    } catch {
+      setPaymentMethod(null)
+    }
+  }
+  useEffect(() => {
+    loadPaymentMethod()
+  }, [])
 
-  const tierInclusion = userProfile.plan_tier ? TIER_INCLUSIONS[userProfile.plan_tier] : null
-  const effectiveTierInclusion = tierInclusion || (isAdmin ? { ticket: 'general_admission', label: 'General Admission (Admin Test)' } : null)
+  // Annual eligible members see a free-claim CTA. Monthly Premium /
+  // Elite / VIP see Buy CTAs (GA + GA Plus) — VIP ticket isn't sold,
+  // only claimed. Admins see Claim by default for testing.
+  const fuseEligibility = getFuseEligibility(
+    userProfile.plan_tier,
+    userProfile.billing_period,
+  )
+  const tierInclusion =
+    fuseEligibility.kind === 'claim'
+      ? TIER_INCLUSIONS[fuseEligibility.planTier] ?? null
+      : null
+  const effectiveTierInclusion =
+    tierInclusion || (isAdmin ? { ticket: 'general_admission', label: 'General Admission (Admin Test)' } : null)
 
   const addonPrices = tierPrices.filter((p) => p.is_addon)
-  const GUEST_PRICE = 399 // TODO: pull from fuse_ticket_prices when guest product is added
 
   const formatDateRange = () => {
     if (!event.start_date) return null
@@ -127,103 +223,34 @@ export function FuseClaimPage({
     return `${m1} ${d1}, ${y}`
   }
 
-  const calculateTotal = () => {
-    let total = 0
-    addonPrices.forEach((addon) => {
-      if (addonState[addon.product_key] && !addon.is_included && addon.price > 0) {
-        total += addon.price
-      }
-    })
-    total += guests.length * GUEST_PRICE
-    return total
-  }
-
-  const addGuest = () => {
-    const id = nextGuestId + 1
-    setNextGuestId(id)
-    setGuests([...guests, { id, firstName: '', lastName: '', email: '' }])
-  }
-
-  const removeGuest = (gid: number) => {
-    setGuests(guests.filter((g) => g.id !== gid))
-  }
-
-  const updateGuest = (gid: number, field: 'firstName' | 'lastName' | 'email', value: string) => {
-    setGuests(guests.map((g) => (g.id === gid ? { ...g, [field]: value } : g)))
-  }
-
-  const toggleAddon = (productKey: string) => {
-    const addon = addonPrices.find((a) => a.product_key === productKey)
-    if (addon?.gender_lock && gender !== addon.gender_lock) return
-    if (addon?.is_included) return
-    setAddonState((prev) => ({ ...prev, [productKey]: !prev[productKey] }))
-  }
-
-  const handleSubmit = async () => {
-    if (!firstName.trim() || !lastName.trim()) { toast.error('Please enter your first and last name'); return }
-    if (!phone.trim()) { toast.error('Please enter your mobile phone number'); return }
-    if (!email.trim()) { toast.error('Please enter your email address'); return }
-    if (!company.trim()) { toast.error('Please enter your company name'); return }
-    if (!gender) { toast.error('Please select your gender'); return }
-    if (!fuseAttendance) { toast.error('Please select how many Fuse events you have attended'); return }
-
+  // Direct claim (step 1): no form-fill, profile-sourced, sets
+  // step_completed='claim'. After success the page reloads and shows the
+  // step 2 surface where the member can add add-ons / guests.
+  const handleDirectClaim = async (overrideTicketType?: string) => {
     setIsSubmitting(true)
-
     try {
-      const total = calculateTotal()
-      const ticketType = effectiveTierInclusion?.ticket || 'general_admission'
-      const hasHallOfAime = !!addonState.hoa || addonPrices.some((p) => p.product_key === 'hoa' && p.is_included)
-      const hasWmnAtFuse = !!addonState.wmn
-
-      // Submit claim — API handles Stripe redirect if there are paid add-ons
       const response = await fetch('/api/fuse-registration/claim', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fuse_event_id: event.id,
-          first_name: firstName.trim(),
-          last_name: lastName.trim(),
-          preferred_name: preferredName.trim() || null,
-          phone: phone.trim(),
-          email: email.trim(),
-          company: company.trim(),
-          gender,
-          fuse_attendance: fuseAttendance,
-          ticket_type: ticketType,
-          has_hall_of_aime: hasHallOfAime,
-          has_wmn_at_fuse: hasWmnAtFuse,
-          marketing_consent: marketingConsent,
-          guests: guests.map((g) => ({
-            full_name: `${g.firstName.trim()} ${g.lastName.trim()}`,
-            email: g.email.trim().toLowerCase(),
-            ticket_type: 'general_admission',
-            is_included: false,
-          })),
+          step: 'claim',
+          ticket_type: overrideTicketType || effectiveTierInclusion?.ticket || 'general_admission',
         }),
       })
-
       const data = await response.json()
-      if (!response.ok) throw new Error(data.error || 'Failed to register')
+      if (!response.ok) throw new Error(data.error || 'Failed to claim')
 
-      // If Stripe checkout needed for paid add-ons, redirect
-      if (data.checkout_url) {
-        window.location.href = data.checkout_url
-        return
-      }
-
-      toast.success('Registration complete!')
-      setModalOpen(false)
-      router.push('/dashboard/fuse-registration/confirmation')
+      toast.success('Ticket claimed! You can now add guests or add-ons.')
       router.refresh()
     } catch (error: any) {
-      toast.error(error.message || 'Failed to complete registration')
+      toast.error(error.message || 'Failed to claim ticket')
     } finally {
       setIsSubmitting(false)
     }
   }
 
   const dateRange = formatDateRange()
-  const total = calculateTotal()
 
   // Input styles
   const inputStyle: React.CSSProperties = {
@@ -252,18 +279,18 @@ export function FuseClaimPage({
         </Link>
 
         {/* Landing card */}
-        <div className="rounded-xl overflow-hidden" style={{ background: '#1a1008', border: '1px solid #3a281844' }}>
+        <div className="rounded-xl overflow-hidden" style={{ background: '#202F60', border: '1px solid #D4A85A33' }}>
           {/* Header with logo */}
-          <div className="p-8 text-center" style={{ borderBottom: '1px solid #c8943a33' }}>
+          <div className="p-8 text-center" style={{ borderBottom: '1px solid #D4A85A33' }}>
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src="/assets/fuse/fuse-logo.png" alt="Fuse Austin" className="h-32 mx-auto mb-3" />
             {dateRange && (
-              <div className="text-lg font-semibold tracking-wider" style={{ color: '#c8a050' }}>
+              <div className="text-lg font-semibold tracking-wider" style={{ color: '#F4E6CA' }}>
                 {dateRange}
               </div>
             )}
             {event.location && (
-              <div className="text-xs tracking-widest uppercase mt-1" style={{ color: '#8a7555' }}>
+              <div className="text-xs tracking-widest uppercase mt-1" style={{ color: '#D4A85A' }}>
                 {event.location}
               </div>
             )}
@@ -271,371 +298,1515 @@ export function FuseClaimPage({
 
           {/* Ticket info */}
           <div className="p-6">
-            {existingRegistration ? (
-              /* Already registered */
-              <div className="text-center py-4">
-                <div className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
-                  style={{ background: 'linear-gradient(135deg, #3a5a20, #4a7a2a)' }}>
-                  <CheckCircle2 className="h-7 w-7" style={{ color: '#e8f0d8' }} />
-                </div>
-                <h2 className="text-xl font-bold mb-2" style={{ color: '#e8d5b0' }}>
-                  You&apos;re Registered!
-                </h2>
-                <p className="text-sm mb-1" style={{ color: '#a08860' }}>
-                  {TICKET_LABELS[existingRegistration.ticket_type] || existingRegistration.ticket_type} ticket claimed
-                </p>
-                <p style={{ color: '#6a5030', fontSize: 13 }}>
-                  We&apos;ll see you at {event.name} in Austin, TX.
-                </p>
-              </div>
+            {existingRegistration && existingRegistration.step_completed === 'claim' ? (
+              /* Claimed but not finalized — step-2 surface */
+              <Step2Panel
+                registrationId={existingRegistration.id}
+                ticketType={existingRegistration.ticket_type}
+                purchaseType={existingRegistration.purchase_type}
+                tier={(userProfile.plan_tier as string | undefined) ?? null}
+                existingHoa={existingRegistration.has_hall_of_aime}
+                existingWmn={existingRegistration.has_wmn_at_fuse}
+                existingVettedVa={existingRegistration.has_vetted_va}
+                existingVipLuncheon={existingRegistration.has_vip_luncheon}
+                eventYear={event.year}
+                addonPrices={addonPrices}
+                allPrices={allPrices}
+                guestPricingRules={guestPricingRules}
+                gender={gender}
+                router={router}
+                inputStyle={inputStyle}
+                labelStyle={labelStyle}
+              />
+            ) : existingRegistration ? (
+              /* Already registered + finalized — management surface */
+              <ManagePanel
+                registration={existingRegistration}
+                eventName={event.name}
+                eventYear={event.year}
+                tier={(userProfile.plan_tier as string | undefined) ?? null}
+                addonPrices={addonPrices}
+                allPrices={allPrices}
+                guestPricingRules={guestPricingRules}
+                gender={gender}
+                router={router}
+                inputStyle={inputStyle}
+                labelStyle={labelStyle}
+              />
             ) : (
-              /* Claim prompt */
+              /* Annual-claim landing CTA. Monthly buyers never see this
+                 — they're auto-reserved at the page level and routed
+                 directly to Step2. */
               <div className="text-center py-4">
                 {effectiveTierInclusion && (
                   <div className="mb-4 rounded-lg px-4 py-2 text-sm inline-block"
-                    style={{ background: '#c8943a22', border: '1px solid #c8943a44', color: '#c8a050' }}>
-                    Your <strong style={{ color: '#e8d5b0' }}>{userProfile.plan_tier}</strong> membership includes a{' '}
-                    <strong style={{ color: '#e8d5b0' }}>{effectiveTierInclusion.label}</strong> ticket
+                    style={{ background: '#D4A85A22', border: '1px solid #D4A85A44', color: '#F4E6CA' }}>
+                    {userProfile.plan_tier === 'VIP' ? (
+                      <>
+                        Your membership includes{' '}
+                        <strong style={{ color: '#ffffff' }}>2 VIP tickets + 2 Hall of AIME tickets</strong>
+                      </>
+                    ) : (
+                      <>
+                        Your membership includes a{' '}
+                        <strong style={{ color: '#ffffff' }}>{effectiveTierInclusion.label}</strong> ticket
+                      </>
+                    )}
                   </div>
                 )}
 
-                {/* Available add-ons preview */}
-                {addonPrices.length > 0 && (
-                  <div className="mb-5 space-y-1">
-                    {addonPrices.map((addon) => (
-                      <div key={addon.id} className="text-sm" style={{ color: '#8a7555' }}>
-                        {addon.label}: {addon.is_included ? (
-                          <span style={{ color: '#4a7a2a' }}>Included</span>
-                        ) : addon.price === 0 ? (
-                          <span style={{ color: '#c8a050' }}>FREE</span>
-                        ) : (
-                          <span style={{ color: '#c8a050' }}>${addon.price}</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <button
-                  onClick={() => setModalOpen(true)}
-                  className="px-8 py-3 font-semibold text-sm rounded-lg transition-all"
-                  style={{
-                    background: 'linear-gradient(135deg, #8a4a10, #a86018, #c87828)',
-                    color: '#f8e8c8',
-                    border: '2px solid #6a3a08',
-                    textShadow: '0 1px 2px rgba(0,0,0,0.3)',
-                    boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
-                    letterSpacing: '0.1em',
-                    textTransform: 'uppercase',
-                    cursor: 'pointer',
-                  }}
-                  onMouseEnter={(e) => (e.currentTarget.style.filter = 'brightness(1.15)')}
-                  onMouseLeave={(e) => (e.currentTarget.style.filter = 'none')}
-                >
-                  Claim Your Ticket &#9733;
-                </button>
+                <div className="flex justify-center">
+                  <button
+                    onClick={() => handleDirectClaim()}
+                    disabled={isSubmitting}
+                    className="px-8 py-3 font-semibold text-sm rounded-full transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                    style={{
+                      background: '#ffffff',
+                      color: '#202F60',
+                      boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+                      letterSpacing: '0.05em',
+                      cursor: isSubmitting ? 'wait' : 'pointer',
+                    }}
+                    onMouseEnter={(e) => !isSubmitting && (e.currentTarget.style.background = '#F4E6CA')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = '#ffffff')}
+                  >
+                    {isSubmitting
+                      ? <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" />Claiming…</span>
+                      : `Claim My ${effectiveTierInclusion?.label || 'Ticket'}`}
+                  </button>
+                </div>
               </div>
             )}
           </div>
         </div>
       </div>
 
-      {/* ===== CLAIM MODAL ===== */}
-      {modalOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ background: 'rgba(10,6,3,0.85)' }}
-          onClick={(e) => { if (e.target === e.currentTarget) setModalOpen(false) }}
-        >
-          <div
-            className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-lg"
-            style={{
-              background: '#e8d5b0',
-              border: '1px solid #c4a872',
-              boxShadow: '0 8px 48px rgba(0,0,0,0.6), inset 0 0 60px rgba(160,120,60,0.15)',
-            }}
-          >
-            {/* Modal header */}
-            <div className="relative px-4 py-3 flex items-center justify-between" style={{
-              background: 'linear-gradient(135deg, #1a1008 0%, #2a1d12 50%, #1a1008 100%)',
-              borderBottom: '2px solid #c8943a44',
-              borderRadius: '8px 8px 0 0',
-            }}>
-              <div className="flex items-center gap-3">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/assets/fuse/fuse-logo.png" alt="" className="h-10" />
-                <div className="text-sm font-semibold tracking-wider" style={{ color: '#c8a050' }}>
-                  Claim Your {effectiveTierInclusion?.label} Ticket
-                </div>
+      <AddCardModal
+        open={addCardOpen}
+        onOpenChange={setAddCardOpen}
+        onSuccess={loadPaymentMethod}
+      />
+    </div>
+  )
+}
+
+// ============================================================
+// Step 2: add-ons + guests for an already-claimed registration
+// ============================================================
+
+interface Step2PanelProps {
+  registrationId: string
+  ticketType: string
+  /**
+   * 'purchased' = monthly buyer with an unpaid main ticket (charge on
+   * finalize). 'claimed' = annual claimer (main ticket already free).
+   * 'upgraded' = post-upgrade. We only need to know whether to charge
+   * the main ticket on finalize.
+   */
+  purchaseType: string
+  tier: string | null
+  /**
+   * Add-ons already locked in on the claimed registration row (e.g. VIP
+   * claims auto-include Hall of AIME). The Step2 gate for per-guest
+   * add-ons must treat these as "main attendee has it" even though the
+   * member never clicked the checkbox.
+   */
+  existingHoa: boolean
+  existingWmn: boolean
+  existingVettedVa: boolean
+  existingVipLuncheon: boolean
+  eventYear: number
+  addonPrices: TierPrice[]
+  allPrices: AllPriceRow[]
+  guestPricingRules: GuestPricingRule[]
+  gender: string
+  router: ReturnType<typeof useRouter>
+  inputStyle: React.CSSProperties
+  labelStyle: React.CSSProperties
+}
+
+function Step2Panel({
+  registrationId,
+  ticketType,
+  purchaseType,
+  tier,
+  existingHoa,
+  existingWmn,
+  existingVettedVa,
+  existingVipLuncheon,
+  eventYear,
+  addonPrices,
+  allPrices,
+  guestPricingRules,
+  gender,
+  router,
+  inputStyle,
+  labelStyle,
+}: Step2PanelProps) {
+  const [addonState, setAddonState] = useState<Record<string, boolean>>({})
+  const [guests, setGuests] = useState<{
+    id: number
+    firstName: string
+    lastName: string
+    addons: {
+      hoa: boolean
+      wmn: boolean
+      vetted_va: boolean
+      vip_luncheon: boolean
+    }
+  }[]>([])
+  const [nextGuestId, setNextGuestId] = useState(0)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+
+  // Payment method for the order summary's card-on-file consent.
+  const [paymentMethod, setPaymentMethod] = useState<
+    { brand: string; last4: string } | null
+  >(null)
+  const [paymentMethodLoading, setPaymentMethodLoading] = useState(true)
+  const [addCardOpen, setAddCardOpen] = useState(false)
+
+  const loadPaymentMethod = async () => {
+    setPaymentMethodLoading(true)
+    try {
+      const res = await fetch('/api/stripe/payment-method')
+      const data = await res.json()
+      setPaymentMethod(data.paymentMethod ?? null)
+    } catch {
+      setPaymentMethod(null)
+    } finally {
+      setPaymentMethodLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadPaymentMethod()
+  }, [])
+
+  // VIP Luncheon is restricted to VIP ticket holders. (GA Plus was
+  // removed for Fuse 2026; the only ticket that unlocks the luncheon
+  // now is VIP.)
+  const vipLuncheonEligible = ticketType === 'vip'
+
+  const toggleAddon = (productKey: string) => {
+    const addon = addonPrices.find((a) => a.product_key === productKey)
+    if (addon?.gender_lock && gender && gender !== addon.gender_lock) return
+    if (addon?.is_included) return
+    if (productKey === 'vip_luncheon' && !vipLuncheonEligible) return
+    setAddonState((prev) => ({ ...prev, [productKey]: !prev[productKey] }))
+  }
+
+  const addGuest = () => {
+    const id = nextGuestId + 1
+    setNextGuestId(id)
+    setGuests([
+      ...guests,
+      {
+        id,
+        firstName: '',
+        lastName: '',
+        addons: { hoa: false, wmn: false, vetted_va: false, vip_luncheon: false },
+      },
+    ])
+  }
+  const removeGuest = (id: number) => setGuests(guests.filter((g) => g.id !== id))
+  const updateGuest = (id: number, field: 'firstName' | 'lastName', value: string) =>
+    setGuests(guests.map((g) => (g.id === id ? { ...g, [field]: value } : g)))
+  const toggleGuestAddon = (
+    id: number,
+    key: 'hoa' | 'wmn' | 'vetted_va' | 'vip_luncheon',
+  ) =>
+    setGuests(
+      guests.map((g) =>
+        g.id === id
+          ? { ...g, addons: { ...g.addons, [key]: !g.addons[key] } }
+          : g,
+      ),
+    )
+
+  // -------------------------------------------------------------
+  // Live order-summary computation. Mirrors the server's planGuestPricing
+  // + HOA logic so the member sees the same totals the server will charge.
+  // -------------------------------------------------------------
+
+  // Guest add-on gating: the main attendee "has" an add-on if it's
+  // already locked in on the registration (e.g. VIP-included HOA) OR if
+  // the member is selecting it in this same finalize batch.
+  const mainHasHoaEffective = existingHoa || !!addonState.hoa
+  const mainHasWmnEffective = existingWmn || !!addonState.wmn
+  const mainHasVettedVaEffective = existingVettedVa || !!addonState.vetted_va
+  const mainHasVipLuncheonEffective = existingVipLuncheon || !!addonState.vip_luncheon
+
+  const guestPlan = planGuestPricing({
+    tier,
+    rules: guestPricingRules,
+    prices: allPrices,
+    existingIncludedCount: 0,
+    existingGuestHoaIncludedCount: 0,
+    newGuests: guests
+      .filter((g) => g.firstName.trim().length > 0)
+      .map((g) => ({
+        full_name: `${g.firstName.trim()} ${g.lastName.trim()}`.trim(),
+        addons: {
+          has_hall_of_aime: g.addons.hoa && mainHasHoaEffective,
+          has_wmn_at_fuse: g.addons.wmn && mainHasWmnEffective,
+          has_vetted_va: g.addons.vetted_va && mainHasVettedVaEffective,
+          has_vip_luncheon: g.addons.vip_luncheon && mainHasVipLuncheonEffective,
+        },
+      })),
+    eventLabel: `Fuse ${eventYear}`,
+  })
+
+  let hoaCents = 0
+  let hoaDisplayCents: number | 'included' = 'included'
+  if (addonState.hoa) {
+    const tierHoa = pickActivePrice(allPrices, 'hoa', tier ?? null)
+    const hoaRow =
+      (tierHoa && !tierHoa.is_included && tierHoa.stripe_price_id ? tierHoa : null) ??
+      pickActivePrice(allPrices, 'hoa', null)
+    if (hoaRow) {
+      if (hoaRow.is_included) {
+        hoaDisplayCents = 'included'
+      } else {
+        hoaCents = (hoaRow.price ?? 0) * 100
+        hoaDisplayCents = hoaCents
+      }
+    }
+  }
+
+  // Monthly buyer with an unpaid main ticket: charge active GA price
+  // on finalize. Annual claimers stay $0 (included).
+  const isPaidReservation = purchaseType === 'purchased'
+  let mainTicketCents = 0
+  if (isPaidReservation) {
+    const mainRow = pickActivePrice(allPrices, 'ga', null)
+    mainTicketCents = (mainRow?.price ?? 0) * 100
+  }
+
+  const totalCents = guestPlan.totalCents + hoaCents + mainTicketCents
+
+  // Build the order summary line items.
+  const orderLines: OrderSummaryLine[] = []
+  if (isPaidReservation) {
+    orderLines.push({
+      label: `${TICKET_LABELS[ticketType] || ticketType} Ticket`,
+      amountCents: mainTicketCents,
+    })
+  } else {
+    orderLines.push({
+      label: `${TICKET_LABELS[ticketType] || ticketType} Ticket`,
+      amountCents: 'included',
+      hint: 'Included with your membership',
+    })
+  }
+  if (addonState.hoa) {
+    orderLines.push({ label: 'Hall of AIME', amountCents: hoaDisplayCents })
+  }
+  if (addonState.wmn) {
+    orderLines.push({ label: 'WMN at Fuse', amountCents: 0 })
+  }
+  if (addonState.vetted_va) {
+    orderLines.push({ label: 'Vetted VA Summit', amountCents: 0 })
+  }
+  if (addonState.vip_luncheon) {
+    orderLines.push({ label: 'VIP Luncheon', amountCents: 0 })
+  }
+  orderLines.push(...guestPlan.displayLineItems)
+
+  const handleFinalize = async () => {
+    setIsSubmitting(true)
+    try {
+      const basePayload = {
+        has_hall_of_aime: !!addonState.hoa,
+        has_wmn_at_fuse: !!addonState.wmn,
+        has_vetted_va: !!addonState.vetted_va,
+        has_vip_luncheon: !!addonState.vip_luncheon,
+        marketing_consent: false,
+        guests: guests
+          .filter((g) => g.firstName.trim().length > 0)
+          .map((g) => ({
+            full_name: `${g.firstName.trim()} ${g.lastName.trim()}`.trim(),
+            ticket_type: 'general_admission',
+            is_included: false,
+            addons: {
+              has_hall_of_aime: g.addons.hoa && mainHasHoaEffective,
+              has_wmn_at_fuse: g.addons.wmn && mainHasWmnEffective,
+              has_vetted_va: g.addons.vetted_va && mainHasVettedVaEffective,
+              has_vip_luncheon: g.addons.vip_luncheon && mainHasVipLuncheonEffective,
+            },
+          })),
+      }
+
+      const callFinalize = (extra: Record<string, unknown> = {}) =>
+        fetch(`/api/fuse-registration/${registrationId}/finalize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...basePayload, ...extra }),
+        })
+
+      let res = await callFinalize()
+      let data = await res.json()
+
+      if (res.status === 402 && data.code === 'no_payment_method') {
+        setAddCardOpen(true)
+        toast.error('Add a payment method to continue.')
+        return
+      }
+
+      if (data.requires_action && data.client_secret) {
+        const stripe = await stripePromise
+        if (!stripe) throw new Error('Payment system unavailable')
+        const { error, paymentIntent } = await stripe.handleNextAction({
+          clientSecret: data.client_secret,
+        })
+        if (error) throw new Error(error.message || 'Authentication failed')
+        if (!paymentIntent || paymentIntent.status !== 'succeeded') {
+          throw new Error('Payment was not completed.')
+        }
+        res = await callFinalize({ confirmed_payment_intent_id: paymentIntent.id })
+        data = await res.json()
+      }
+
+      if (!res.ok) throw new Error(data.error || 'Failed to finalize')
+
+      toast.success('Registration complete!')
+      router.refresh()
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to save')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  const handleSkip = () => {
+    router.push('/dashboard')
+  }
+
+  return (
+    <div className="py-2">
+      <div className="text-center mb-6">
+        <div className="w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3"
+          style={{ background: 'linear-gradient(135deg, #3a5a20, #4a7a2a)' }}>
+          <CheckCircle2 className="h-6 w-6" style={{ color: '#e8f0d8' }} />
+        </div>
+        <h2 className="text-xl font-bold mb-1" style={{ color: '#e8d5b0' }}>
+          You&apos;re Claimed!
+        </h2>
+        <p className="text-xs" style={{ color: '#a08860' }}>
+          {TICKET_LABELS[ticketType] || ticketType} ticket secured. Add guests or add-ons below, or do it later.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-6">
+        {/* LEFT — controls */}
+        <div>
+          {/* Add-Ons: clean inline rows, matching public reference */}
+          <div className="mb-6">
+            <h3 className="font-bold text-base mb-3" style={{ color: '#F4E6CA' }}>
+              Add Ons
+            </h3>
+            {addonPrices.length === 0 ? (
+              <div className="text-xs italic" style={{ color: '#D4A85A' }}>
+                No add-ons available for your tier.
               </div>
-              <button
-                onClick={() => setModalOpen(false)}
-                className="text-2xl leading-none"
-                style={{ color: '#6a5030', cursor: 'pointer' }}
-              >
-                &times;
-              </button>
-            </div>
-
-            {/* Modal form */}
-            <div className="p-5 space-y-3" style={{ color: '#3a2a18' }}>
-
-              {/* Name */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label style={labelStyle}>First Name <span style={{ color: '#b04020' }}>*</span></label>
-                  <input style={inputStyle} value={firstName} onChange={(e) => setFirstName(e.target.value)} placeholder="First name" />
-                </div>
-                <div>
-                  <label style={labelStyle}>Last Name <span style={{ color: '#b04020' }}>*</span></label>
-                  <input style={inputStyle} value={lastName} onChange={(e) => setLastName(e.target.value)} placeholder="Last name" />
-                </div>
-              </div>
-
-              {/* Preferred Name */}
-              <div>
-                <label style={labelStyle}>Preferred Name <span style={{ color: '#8a7050', textTransform: 'none', letterSpacing: 0, fontWeight: 400, fontStyle: 'italic' }}>— Badge name</span></label>
-                <input style={inputStyle} value={preferredName} onChange={(e) => setPreferredName(e.target.value)} placeholder="e.g. JJ" />
-              </div>
-
-              {/* Phone & Email */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label style={labelStyle}>Mobile Phone <span style={{ color: '#b04020' }}>*</span></label>
-                  <input style={inputStyle} type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Phone" />
-                </div>
-                <div>
-                  <label style={labelStyle}>Email Address <span style={{ color: '#b04020' }}>*</span></label>
-                  <input style={inputStyle} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" />
-                </div>
-              </div>
-
-              {/* Company */}
-              <div>
-                <label style={labelStyle}>Company Name <span style={{ color: '#b04020' }}>*</span></label>
-                <input style={inputStyle} value={company} onChange={(e) => setCompany(e.target.value)} placeholder="Company name" />
-              </div>
-
-              {/* Gender & Attendance */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label style={labelStyle}>Gender <span style={{ color: '#b04020' }}>*</span></label>
-                  <select style={selectStyle} value={gender} onChange={(e) => setGender(e.target.value)}>
-                    <option value="">Select...</option>
-                    {GENDER_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label style={labelStyle}>Fuse Events Attended <span style={{ color: '#b04020' }}>*</span></label>
-                  <select style={selectStyle} value={fuseAttendance} onChange={(e) => setFuseAttendance(e.target.value)}>
-                    <option value="">Select...</option>
-                    {FUSE_ATTENDANCE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                  </select>
-                </div>
-              </div>
-
-              {/* Divider */}
-              <div style={{ borderTop: '2px solid #d4b880', paddingTop: 12 }}>
-                <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.14em', textTransform: 'uppercase', color: '#6a5030', marginBottom: 8 }}>
-                  Your Ticket
-                </div>
-
-                {/* Included ticket */}
-                <div style={{
-                  background: '#f8e4b4', border: '2px solid #8a4a10', borderRadius: 6,
-                  padding: 16, boxShadow: '0 0 0 3px #8a4a1022',
-                }}>
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <div style={{ fontWeight: 700, color: '#3a2a10', fontSize: 14 }}>
-                        {effectiveTierInclusion?.label}
-                      </div>
-                      <div style={{ fontSize: 11, color: '#8a7050', marginTop: 2 }}>
-                        Included with {userProfile.plan_tier} membership
-                      </div>
-                    </div>
-                    <span style={{ fontWeight: 700, color: '#3a5a20', fontSize: 15 }}>Included</span>
-                  </div>
-                </div>
-
-                {/* VIP Guest if applicable */}
-                {tierPrices.filter((p) => p.product_key === 'vip_guest' && p.is_included).map((p) => (
-                  <div key={p.id} style={{
-                    background: '#f8e4b4', border: '2px solid #8a4a10', borderRadius: 6,
-                    padding: 16, marginTop: 10, boxShadow: '0 0 0 3px #8a4a1022',
-                  }}>
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div style={{ fontWeight: 700, color: '#3a2a10', fontSize: 14 }}>{p.label}</div>
-                        <div style={{ fontSize: 11, color: '#8a7050', marginTop: 2 }}>{p.description}</div>
-                      </div>
-                      <span style={{ fontWeight: 700, color: '#3a5a20', fontSize: 15 }}>Included</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Bring a Guest */}
-              <div style={{ borderTop: '2px solid #d4b880', paddingTop: 12 }}>
-                <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.14em', textTransform: 'uppercase', color: '#6a5030', marginBottom: 4 }}>
-                  Bring a Guest
-                </div>
-                <div style={{ fontSize: 12, color: '#8a7050', marginBottom: 12 }}>
-                  Guest tickets are ${GUEST_PRICE} each
-                </div>
-
-                {guests.map((g, idx) => (
-                  <div key={g.id} style={{
-                    background: '#f0ddb8', border: '1px solid #c4a872', borderRadius: 6,
-                    padding: 16, marginBottom: 10,
-                    boxShadow: 'inset 0 1px 4px rgba(100,60,20,0.06)',
-                  }}>
-                    <div className="flex items-center justify-between" style={{ marginBottom: 12 }}>
-                      <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#6a5030' }}>
-                        Guest {idx + 1}
+            ) : (
+              <div className="divide-y" style={{ borderColor: '#D4A85A33' }}>
+                {addonPrices.map((addon) => {
+                  const isIncluded = addon.is_included
+                  const isGenderLocked = !!(addon.gender_lock && gender && gender !== addon.gender_lock)
+                  const isTicketLocked = addon.product_key === 'vip_luncheon' && !vipLuncheonEligible
+                  const isLocked = isGenderLocked || isTicketLocked
+                  const isSelected = isIncluded || !!addonState[addon.product_key]
+                  const sale = getAddonSaleInfo(addon, allPrices)
+                  return (
+                    <label
+                      key={addon.id}
+                      className="flex items-center gap-3 py-3 transition-colors"
+                      style={{
+                        color: '#F4E6CA',
+                        opacity: isLocked ? 0.5 : 1,
+                        cursor: isIncluded || isLocked ? 'not-allowed' : 'pointer',
+                        borderTop: '1px solid #D4A85A22',
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        disabled={isIncluded || isLocked}
+                        onChange={() => toggleAddon(addon.product_key)}
+                        className="h-4 w-4 cursor-pointer accent-[#A0282A] flex-shrink-0"
+                      />
+                      <span className="font-semibold text-sm">{addon.label}</span>
+                      {sale && (
+                        <span className="text-[10px] uppercase tracking-wider font-semibold whitespace-nowrap" style={{ color: '#D4A85A' }}>
+                          Early-Bird until {formatSaleEndDate(sale.earlyBirdEndAt)}
+                        </span>
+                      )}
+                      {isGenderLocked && (
+                        <span className="text-[10px] italic whitespace-nowrap" style={{ color: '#A0282A' }}>
+                          (Women only)
+                        </span>
+                      )}
+                      {isTicketLocked && (
+                        <span className="text-[10px] italic whitespace-nowrap" style={{ color: '#A0282A' }}>
+                          (VIP only)
+                        </span>
+                      )}
+                      <span className="ml-auto text-sm font-bold flex items-baseline gap-1.5 whitespace-nowrap" style={{ color: '#F4E6CA' }}>
+                        {sale && (
+                          <span className="line-through opacity-50 font-normal" style={{ color: '#D4A85A' }}>
+                            ${sale.regularPrice}
+                          </span>
+                        )}
+                        <span>
+                          {isIncluded ? 'Included' : addon.price === 0 ? 'Free' : `$${addon.price}`}
+                        </span>
                       </span>
-                      <div className="flex items-center gap-3">
-                        <span style={{ fontSize: 13, fontWeight: 700, color: '#5a3a10' }}>${GUEST_PRICE}</span>
+                    </label>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Bring a Guest — full-width button matching public reference */}
+          <div className="mb-6">
+            <h3 className="font-bold text-base mb-3" style={{ color: '#F4E6CA' }}>
+              Bring a Guest
+            </h3>
+            {guests.length > 0 && (
+              <div className="space-y-3 mb-3">
+                {guests.map((g) => {
+                  const mainAddonGates: Array<{
+                    key: 'hoa' | 'wmn' | 'vetted_va' | 'vip_luncheon'
+                    label: string
+                    enabled: boolean
+                  }> = [
+                    { key: 'hoa', label: 'Hall of AIME', enabled: mainHasHoaEffective },
+                    { key: 'wmn', label: 'WMN at Fuse', enabled: mainHasWmnEffective },
+                    { key: 'vetted_va', label: 'Vetted VA', enabled: mainHasVettedVaEffective },
+                    { key: 'vip_luncheon', label: 'VIP Luncheon', enabled: mainHasVipLuncheonEffective },
+                  ]
+                  return (
+                    <div
+                      key={g.id}
+                      className="rounded-lg p-3 space-y-2"
+                      style={{ background: '#202F6055', border: '1px solid #D4A85A33' }}
+                    >
+                      <div className="flex gap-2 items-start">
+                        <input
+                          placeholder="First name"
+                          value={g.firstName}
+                          onChange={(e) => updateGuest(g.id, 'firstName', e.target.value)}
+                          style={inputStyle}
+                        />
+                        <input
+                          placeholder="Last name"
+                          value={g.lastName}
+                          onChange={(e) => updateGuest(g.id, 'lastName', e.target.value)}
+                          style={inputStyle}
+                        />
                         <button
                           type="button"
                           onClick={() => removeGuest(g.id)}
-                          style={{ background: 'none', border: 'none', color: '#a06040', cursor: 'pointer', fontSize: 18, fontWeight: 700, lineHeight: 1, padding: '0 4px' }}
+                          className="text-xs px-2 self-center"
+                          style={{ color: '#A0282A' }}
+                          aria-label="Remove guest"
                         >
-                          &times;
+                          ✕
                         </button>
                       </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3" style={{ marginBottom: 8 }}>
-                      <div>
-                        <label style={labelStyle}>First Name <span style={{ color: '#b04020' }}>*</span></label>
-                        <input style={inputStyle} value={g.firstName} onChange={(e) => updateGuest(g.id, 'firstName', e.target.value)} placeholder="First name" />
+                      <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs" style={{ color: '#F4E6CAcc' }}>
+                        {mainAddonGates.map((gate) => (
+                          <label
+                            key={gate.key}
+                            className={`inline-flex items-center gap-1.5 ${
+                              gate.enabled ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'
+                            }`}
+                            title={gate.enabled ? '' : `Add ${gate.label} for yourself to enable for this guest`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={gate.enabled && g.addons[gate.key]}
+                              disabled={!gate.enabled}
+                              onChange={() => gate.enabled && toggleGuestAddon(g.id, gate.key)}
+                              className="h-3.5 w-3.5 accent-[#A0282A]"
+                            />
+                            {gate.label}
+                          </label>
+                        ))}
                       </div>
-                      <div>
-                        <label style={labelStyle}>Last Name <span style={{ color: '#b04020' }}>*</span></label>
-                        <input style={inputStyle} value={g.lastName} onChange={(e) => updateGuest(g.id, 'lastName', e.target.value)} placeholder="Last name" />
-                      </div>
                     </div>
-                    <div>
-                      <label style={labelStyle}>Email Address <span style={{ color: '#b04020' }}>*</span></label>
-                      <input style={inputStyle} type="email" value={g.email} onChange={(e) => updateGuest(g.id, 'email', e.target.value)} placeholder="guest@email.com" />
-                    </div>
-                  </div>
-                ))}
-
-                <button
-                  type="button"
-                  onClick={addGuest}
-                  className="flex items-center justify-center gap-2 w-full"
-                  style={{
-                    background: '#f5e8cc', border: '2px dashed #c4a872', borderRadius: 6,
-                    padding: 14, color: '#8a6a30', fontSize: 13, fontWeight: 600,
-                    cursor: 'pointer', transition: 'all 0.2s',
-                  }}
-                  onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#a07030'; e.currentTarget.style.background = '#f0e0bc' }}
-                  onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#c4a872'; e.currentTarget.style.background = '#f5e8cc' }}
-                >
-                  <span style={{ fontSize: 18, fontWeight: 700, lineHeight: 1 }}>+</span>
-                  <span>Add a Guest</span>
-                </button>
-
-                {guests.length > 0 && (
-                  <div style={{ fontSize: 11, color: '#8a7050', textAlign: 'center', marginTop: 4 }}>
-                    {guests.length} guest{guests.length > 1 ? 's' : ''} added — ${(guests.length * GUEST_PRICE).toLocaleString()}
-                  </div>
-                )}
+                  )
+                })}
               </div>
+            )}
+            <button
+              type="button"
+              onClick={addGuest}
+              className="w-full py-3 font-bold text-sm uppercase tracking-wider rounded-lg transition-colors"
+              style={{
+                background: '#D4A85A',
+                color: '#3A1F1A',
+                letterSpacing: '0.1em',
+              }}
+            >
+              + Add a Guest
+            </button>
+          </div>
+        </div>
 
-              {/* Add-ons */}
-              {addonPrices.length > 0 && (
-                <div style={{ borderTop: '2px solid #d4b880', paddingTop: 12 }}>
-                  <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.14em', textTransform: 'uppercase', color: '#6a5030', marginBottom: 4 }}>
-                    Add-Ons
-                  </div>
-                  <div style={{ fontSize: 12, color: '#8a7050', marginBottom: 12 }}>Enhance your Fuse experience</div>
+        {/* RIGHT — Order Summary */}
+        <div className="lg:sticky lg:top-4 lg:self-start">
+          <OrderSummary
+            title="Order Summary"
+            lineItems={orderLines}
+            totalCents={totalCents}
+            paymentMethod={paymentMethod}
+            paymentMethodLoading={paymentMethodLoading}
+            onUseDifferentCard={() => setAddCardOpen(true)}
+            onPurchase={handleFinalize}
+            purchaseLabel={totalCents > 0 ? 'Complete Registration' : 'Confirm'}
+            isSubmitting={isSubmitting}
+            canPurchase={true}
+            showPayment={totalCents > 0}
+          />
+          <button
+            type="button"
+            onClick={handleSkip}
+            disabled={isSubmitting}
+            className="w-full mt-3 px-4 py-2 text-xs rounded-lg transition-colors"
+            style={{
+              background: 'transparent',
+              border: '1px solid #6a5030',
+              color: '#a08860',
+              letterSpacing: '0.08em',
+            }}
+          >
+            Skip for now
+          </button>
+        </div>
+      </div>
 
-                  <div className="space-y-2">
-                    {addonPrices.map((addon) => {
-                      const isLocked = !!(addon.gender_lock && gender !== addon.gender_lock)
-                      const isSelected = addon.is_included || !!addonState[addon.product_key]
-                      return (
-                        <div
-                          key={addon.id}
-                          className="flex items-center gap-3"
-                          style={{
-                            background: isSelected ? '#f8e4b4' : '#f5e8cc',
-                            border: `2px solid ${isSelected ? '#8a4a10' : '#c4a872'}`,
-                            borderRadius: 6, padding: '14px 16px',
-                            cursor: addon.is_included ? 'default' : isLocked ? 'not-allowed' : 'pointer',
-                            opacity: isLocked ? 0.4 : 1, transition: 'all 0.2s',
-                          }}
-                          onClick={() => !addon.is_included && toggleAddon(addon.product_key)}
-                        >
-                          <div style={{ flexShrink: 0 }}>
-                            {isSelected ? (
-                              <div style={{ width: 20, height: 20, background: 'linear-gradient(135deg, #8a4a10, #a86018)', borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 11, fontWeight: 700 }}>&#10003;</div>
-                            ) : (
-                              <div style={{ width: 20, height: 20, border: '2px solid #c4a872', borderRadius: 4, background: '#f5e8cc' }} />
-                            )}
-                          </div>
-                          <div style={{ flex: 1 }}>
-                            <div style={{ fontSize: 13, fontWeight: 700, color: '#3a2a10', display: 'flex', alignItems: 'center', gap: 8 }}>
-                              {addon.label}
-                              {addon.gender_lock === 'female' && (
-                                <span style={{ fontSize: 9, letterSpacing: '0.1em', color: '#8a3870', fontWeight: 700, textTransform: 'uppercase', border: '1px solid #8a387066', padding: '2px 5px', borderRadius: 3 }}>Women Only</span>
-                              )}
-                            </div>
-                            <div style={{ fontSize: 11, color: '#8a7050', lineHeight: 1.4 }}>{addon.description}</div>
-                          </div>
-                          <div style={{ flexShrink: 0, fontSize: 15, fontWeight: 700, color: '#3a2a10' }}>
-                            {addon.is_included ? <span style={{ color: '#3a5a20' }}>Included</span> : addon.price === 0 ? 'FREE' : `$${addon.price}`}
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
+      <AddCardModal
+        open={addCardOpen}
+        onOpenChange={setAddCardOpen}
+        onSuccess={loadPaymentMethod}
+      />
+    </div>
+  )
+}
+
+// ============================================================
+// Finalized: management surface (Phase 7d)
+// ============================================================
+
+interface ManagePanelProps {
+  registration: {
+    id: string
+    ticket_type: string
+    has_hall_of_aime: boolean
+    has_wmn_at_fuse: boolean
+    has_vetted_va: boolean
+    has_vip_luncheon: boolean
+    step_completed: 'claim' | 'finalized'
+    guests?: Array<{
+      id: string
+      full_name: string
+      ticket_type: string
+      is_included: boolean
+      has_hall_of_aime?: boolean
+      has_wmn_at_fuse?: boolean
+      has_vetted_va?: boolean
+      has_vip_luncheon?: boolean
+    }>
+  }
+  eventName: string
+  eventYear: number
+  tier: string | null
+  addonPrices: TierPrice[]
+  allPrices: AllPriceRow[]
+  guestPricingRules: GuestPricingRule[]
+  gender: string
+  router: ReturnType<typeof useRouter>
+  inputStyle: React.CSSProperties
+  labelStyle: React.CSSProperties
+}
+
+function ManagePanel({
+  registration,
+  eventName,
+  eventYear,
+  tier,
+  addonPrices,
+  allPrices,
+  guestPricingRules,
+  gender,
+  router,
+  inputStyle,
+  labelStyle,
+}: ManagePanelProps) {
+  const guests = registration.guests || []
+
+  // State for new additions (only saved on "Save changes")
+  const [newGuests, setNewGuests] = useState<{
+    id: number
+    firstName: string
+    lastName: string
+    addons: {
+      hoa: boolean
+      wmn: boolean
+      vetted_va: boolean
+      vip_luncheon: boolean
+    }
+  }[]>([])
+  const [nextNewGuestId, setNextNewGuestId] = useState(0)
+  const [addAddons, setAddAddons] = useState<{
+    hoa: boolean
+    wmn: boolean
+    vetted_va: boolean
+    vip_luncheon: boolean
+  }>({ hoa: false, wmn: false, vetted_va: false, vip_luncheon: false })
+  const [isSubmitting, setIsSubmitting] = useState(false)
+
+  // VIP Luncheon is restricted to VIP ticket holders. (GA Plus was
+  // removed for Fuse 2026.) Legacy general_admission_plus rows in the
+  // DB still keep the luncheon flag they had — they just can't add
+  // more from the manage panel without VIP.
+  const vipLuncheonEligible =
+    registration.ticket_type === 'vip' ||
+    registration.ticket_type === 'general_admission_plus'
+
+  // State for inline guest name edits
+  const [editingGuestId, setEditingGuestId] = useState<string | null>(null)
+  const [editingName, setEditingName] = useState('')
+  const [editingAddons, setEditingAddons] = useState<{
+    hoa: boolean
+    wmn: boolean
+    vetted_va: boolean
+    vip_luncheon: boolean
+  }>({ hoa: false, wmn: false, vetted_va: false, vip_luncheon: false })
+  const [savingGuestId, setSavingGuestId] = useState<string | null>(null)
+
+  // Card on file (for the consent line above Save Changes)
+  const [paymentMethod, setPaymentMethod] = useState<
+    { brand: string; last4: string; expMonth: number; expYear: number } | null
+  >(null)
+  const [paymentMethodLoading, setPaymentMethodLoading] = useState(true)
+  const [addCardOpen, setAddCardOpen] = useState(false)
+
+  const loadPaymentMethod = async () => {
+    setPaymentMethodLoading(true)
+    try {
+      const res = await fetch('/api/stripe/payment-method')
+      const data = await res.json()
+      setPaymentMethod(data.paymentMethod ?? null)
+    } catch {
+      setPaymentMethod(null)
+    } finally {
+      setPaymentMethodLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadPaymentMethod()
+  }, [])
+
+  // Available add-ons that haven't been claimed yet
+  const availableAddons = addonPrices.filter((a) => {
+    if (a.is_included) return false
+    if (a.product_key === 'hoa' && registration.has_hall_of_aime) return false
+    if (a.product_key === 'wmn' && registration.has_wmn_at_fuse) return false
+    if (a.product_key === 'vetted_va' && registration.has_vetted_va) return false
+    if (a.product_key === 'vip_luncheon' && registration.has_vip_luncheon) return false
+    return true
+  })
+
+  const hasPendingChanges =
+    newGuests.some((g) => g.firstName.trim().length > 0) ||
+    addAddons.hoa ||
+    addAddons.wmn ||
+    addAddons.vetted_va ||
+    addAddons.vip_luncheon
+
+  // -------------------------------------------------------------
+  // Live order-summary computation for the pending top-up batch.
+  // Mirrors the server's planGuestPricing + HOA logic, accounting
+  // for any already-included guests on the existing registration
+  // (VIP first-guest slot may already be consumed).
+  // -------------------------------------------------------------
+
+  const existingIncludedCount = guests.filter((g) => g.is_included).length
+  const existingGuestHoaIncludedCount = guests.filter((g) => !!g.has_hall_of_aime).length
+
+  // Guest add-ons gate against what the registration already carries OR
+  // what's being added in this same top-up batch.
+  const mainHasHoaEffective = registration.has_hall_of_aime || addAddons.hoa
+  const mainHasWmnEffective = registration.has_wmn_at_fuse || addAddons.wmn
+  const mainHasVettedVaEffective = registration.has_vetted_va || addAddons.vetted_va
+  const mainHasVipLuncheonEffective =
+    registration.has_vip_luncheon || addAddons.vip_luncheon
+
+  const guestPlan = planGuestPricing({
+    tier,
+    rules: guestPricingRules,
+    prices: allPrices,
+    existingIncludedCount,
+    existingGuestHoaIncludedCount,
+    newGuests: newGuests
+      .filter((g) => g.firstName.trim().length > 0)
+      .map((g) => ({
+        full_name: `${g.firstName.trim()} ${g.lastName.trim()}`.trim(),
+        addons: {
+          has_hall_of_aime: g.addons.hoa && mainHasHoaEffective,
+          has_wmn_at_fuse: g.addons.wmn && mainHasWmnEffective,
+          has_vetted_va: g.addons.vetted_va && mainHasVettedVaEffective,
+          has_vip_luncheon: g.addons.vip_luncheon && mainHasVipLuncheonEffective,
+        },
+      })),
+    eventLabel: `Fuse ${eventYear}`,
+  })
+
+  let pendingHoaCents = 0
+  let pendingHoaDisplay: number | 'included' = 'included'
+  if (addAddons.hoa) {
+    const tierHoa = pickActivePrice(allPrices, 'hoa', tier ?? null)
+    const hoaRow =
+      (tierHoa && !tierHoa.is_included && tierHoa.stripe_price_id ? tierHoa : null) ??
+      pickActivePrice(allPrices, 'hoa', null)
+    if (hoaRow) {
+      if (hoaRow.is_included) {
+        pendingHoaDisplay = 'included'
+      } else {
+        pendingHoaCents = (hoaRow.price ?? 0) * 100
+        pendingHoaDisplay = pendingHoaCents
+      }
+    }
+  }
+
+  const pendingTotalCents = guestPlan.totalCents + pendingHoaCents
+
+  const pendingOrderLines: OrderSummaryLine[] = []
+  if (addAddons.hoa) {
+    pendingOrderLines.push({ label: 'Hall of AIME', amountCents: pendingHoaDisplay })
+  }
+  if (addAddons.wmn) {
+    pendingOrderLines.push({ label: 'WMN at Fuse', amountCents: 0 })
+  }
+  if (addAddons.vetted_va) {
+    pendingOrderLines.push({ label: 'Vetted VA Summit', amountCents: 0 })
+  }
+  if (addAddons.vip_luncheon) {
+    pendingOrderLines.push({ label: 'VIP Luncheon', amountCents: 0 })
+  }
+  pendingOrderLines.push(...guestPlan.displayLineItems)
+
+  const startEditGuest = (g: {
+    id: string
+    full_name: string
+    has_hall_of_aime?: boolean
+    has_wmn_at_fuse?: boolean
+    has_vetted_va?: boolean
+    has_vip_luncheon?: boolean
+  }) => {
+    setEditingGuestId(g.id)
+    setEditingName(g.full_name)
+    setEditingAddons({
+      hoa: !!g.has_hall_of_aime,
+      wmn: !!g.has_wmn_at_fuse,
+      vetted_va: !!g.has_vetted_va,
+      vip_luncheon: !!g.has_vip_luncheon,
+    })
+  }
+  const cancelEditGuest = () => {
+    setEditingGuestId(null)
+    setEditingName('')
+    setEditingAddons({ hoa: false, wmn: false, vetted_va: false, vip_luncheon: false })
+  }
+  const toggleEditingAddon = (
+    key: 'hoa' | 'wmn' | 'vetted_va' | 'vip_luncheon',
+  ) => setEditingAddons((prev) => ({ ...prev, [key]: !prev[key] }))
+
+  const saveEditGuest = async (guestId: string) => {
+    const trimmed = editingName.trim()
+    if (!trimmed) {
+      toast.error('Name cannot be empty')
+      return
+    }
+    setSavingGuestId(guestId)
+    try {
+      // Only the 3 free add-ons go through this PATCH. HOA is set when
+      // the guest is added (it's a paid line item) and can't be flipped
+      // here without running through the top-up payment flow.
+      const res = await fetch(
+        `/api/fuse-registration/${registration.id}/guests/${guestId}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            full_name: trimmed,
+            addons: {
+              has_wmn_at_fuse: editingAddons.wmn,
+              has_vetted_va: editingAddons.vetted_va,
+              has_vip_luncheon: editingAddons.vip_luncheon,
+            },
+          }),
+        },
+      )
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Failed to update guest')
+
+      toast.success('Guest updated')
+      setEditingGuestId(null)
+      setEditingName('')
+      setEditingAddons({ hoa: false, wmn: false, vetted_va: false, vip_luncheon: false })
+      router.refresh()
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to update guest')
+    } finally {
+      setSavingGuestId(null)
+    }
+  }
+
+  const addNewGuestRow = () => {
+    const id = nextNewGuestId + 1
+    setNextNewGuestId(id)
+    setNewGuests([
+      ...newGuests,
+      {
+        id,
+        firstName: '',
+        lastName: '',
+        addons: { hoa: false, wmn: false, vetted_va: false, vip_luncheon: false },
+      },
+    ])
+  }
+  const removeNewGuestRow = (id: number) =>
+    setNewGuests(newGuests.filter((g) => g.id !== id))
+  const updateNewGuestRow = (id: number, field: 'firstName' | 'lastName', value: string) =>
+    setNewGuests(newGuests.map((g) => (g.id === id ? { ...g, [field]: value } : g)))
+  const toggleNewGuestAddon = (
+    id: number,
+    key: 'hoa' | 'wmn' | 'vetted_va' | 'vip_luncheon',
+  ) =>
+    setNewGuests(
+      newGuests.map((g) =>
+        g.id === id
+          ? { ...g, addons: { ...g.addons, [key]: !g.addons[key] } }
+          : g,
+      ),
+    )
+
+  const toggleAddAddon = (key: 'hoa' | 'wmn' | 'vetted_va' | 'vip_luncheon') => {
+    const addon = addonPrices.find((a) => a.product_key === key)
+    if (addon?.gender_lock && gender && gender !== addon.gender_lock) return
+    if (key === 'vip_luncheon' && !vipLuncheonEligible) return
+    setAddAddons((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+
+  const handleSaveChanges = async () => {
+    setIsSubmitting(true)
+    try {
+      const basePayload = {
+        add_hall_of_aime: addAddons.hoa,
+        add_wmn_at_fuse: addAddons.wmn,
+        add_vetted_va: addAddons.vetted_va,
+        add_vip_luncheon: addAddons.vip_luncheon,
+        new_guests: newGuests
+          .filter((g) => g.firstName.trim().length > 0)
+          .map((g) => ({
+            full_name: `${g.firstName.trim()} ${g.lastName.trim()}`.trim(),
+            ticket_type: 'general_admission',
+            is_included: false,
+            addons: {
+              has_hall_of_aime: g.addons.hoa && mainHasHoaEffective,
+              has_wmn_at_fuse: g.addons.wmn && mainHasWmnEffective,
+              has_vetted_va: g.addons.vetted_va && mainHasVettedVaEffective,
+              has_vip_luncheon: g.addons.vip_luncheon && mainHasVipLuncheonEffective,
+            },
+          })),
+      }
+
+      const callTopUp = (extra: Record<string, unknown> = {}) =>
+        fetch(`/api/fuse-registration/${registration.id}/top-up`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...basePayload, ...extra }),
+        })
+
+      let res = await callTopUp()
+      let data = await res.json()
+
+      // No payment method on file — prompt to add one, then user retries.
+      if (res.status === 402 && data.code === 'no_payment_method') {
+        setAddCardOpen(true)
+        toast.error('Add a payment method to continue.')
+        return
+      }
+
+      // 3DS / Strong Customer Authentication: client runs handleNextAction,
+      // then re-posts the same body with the confirmed PaymentIntent id.
+      if (data.requires_action && data.client_secret) {
+        const stripe = await stripePromise
+        if (!stripe) throw new Error('Payment system unavailable')
+        const { error, paymentIntent } = await stripe.handleNextAction({
+          clientSecret: data.client_secret,
+        })
+        if (error) throw new Error(error.message || 'Authentication failed')
+        if (!paymentIntent || paymentIntent.status !== 'succeeded') {
+          throw new Error('Payment was not completed.')
+        }
+        res = await callTopUp({ confirmed_payment_intent_id: paymentIntent.id })
+        data = await res.json()
+      }
+
+      if (!res.ok) throw new Error(data.error || 'Failed to save changes')
+
+      toast.success('Changes saved')
+      setNewGuests([])
+      setAddAddons({ hoa: false, wmn: false, vetted_va: false, vip_luncheon: false })
+      router.refresh()
+    } catch (error: any) {
+      toast.error(error.message || 'Failed to save changes')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="py-2">
+      {/* Header */}
+      <div className="text-center mb-6">
+        <div className="w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3"
+          style={{ background: 'linear-gradient(135deg, #3a5a20, #4a7a2a)' }}>
+          <CheckCircle2 className="h-6 w-6" style={{ color: '#e8f0d8' }} />
+        </div>
+        <h2 className="text-xl font-bold mb-1" style={{ color: '#F4E6CA' }}>
+          You&apos;re Registered for {eventName}
+        </h2>
+        <p className="text-xs" style={{ color: '#D4A85A' }}>
+          {TICKET_LABELS[registration.ticket_type] || registration.ticket_type} ticket
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-6">
+        {/* LEFT — Add-Ons + Guests, unified (existing + addable) */}
+        <div>
+          {/* Add-Ons: clean inline rows */}
+          <div className="mb-6">
+            <h3 className="font-bold text-base mb-3" style={{ color: '#F4E6CA' }}>
+              Add Ons
+            </h3>
+            {/* Empty state */}
+            {availableAddons.length === 0 &&
+              !registration.has_hall_of_aime &&
+              !registration.has_wmn_at_fuse &&
+              !registration.has_vetted_va &&
+              !registration.has_vip_luncheon && (
+                <div className="text-xs italic" style={{ color: '#8a7555' }}>
+                  No add-ons available for your tier.
                 </div>
               )}
 
-              {/* Marketing Consent */}
-              <label className="flex items-start gap-3 text-sm cursor-pointer" style={{ color: '#6a5030' }}>
-                <input type="checkbox" checked={marketingConsent} onChange={(e) => setMarketingConsent(e.target.checked)} className="mt-1" style={{ accentColor: '#8a4a10' }} />
-                <span>
-                  I consent to receive marketing and promotional messages. Message frequency may vary. Reply <strong>HELP</strong> for help or <strong>STOP</strong> to opt-out.
-                </span>
-              </label>
+            {/* Confirmed (existing) + addable, all as inline rows */}
+            <div>
+              {[
+                { key: 'hoa', label: 'Hall of AIME', confirmed: registration.has_hall_of_aime },
+                { key: 'wmn', label: 'WMN at Fuse', confirmed: registration.has_wmn_at_fuse },
+                { key: 'vetted_va', label: 'Vetted VA Summit', confirmed: registration.has_vetted_va },
+                { key: 'vip_luncheon', label: 'VIP Luncheon', confirmed: registration.has_vip_luncheon },
+              ]
+                .filter((r) => r.confirmed)
+                .map((r) => (
+                  <div
+                    key={`confirmed-${r.key}`}
+                    className="flex items-center gap-3 py-3"
+                    style={{ color: '#F4E6CA', borderTop: '1px solid #D4A85A22' }}
+                  >
+                    <span
+                      className="h-4 w-4 rounded flex items-center justify-center text-[10px] flex-shrink-0"
+                      style={{ background: '#3a5a20', color: '#F4E6CA' }}
+                    >
+                      ✓
+                    </span>
+                    <span className="font-semibold text-sm">{r.label}</span>
+                    <span className="text-[10px] italic" style={{ color: '#7ac97a' }}>
+                      Confirmed
+                    </span>
+                  </div>
+                ))}
 
-              {/* Submit */}
-              <button
-                onClick={handleSubmit}
-                disabled={isSubmitting}
-                style={{
-                  width: '100%',
-                  background: total > 0
-                    ? 'linear-gradient(135deg, #8a4a10, #a86018, #c87828)'
-                    : 'linear-gradient(135deg, #3a5a20, #4a7a2a, #5a8a3a)',
-                  color: total > 0 ? '#f8e8c8' : '#e8f0d8',
-                  border: `2px solid ${total > 0 ? '#6a3a08' : '#2a4018'}`,
-                  borderRadius: 5, padding: '14px 24px', fontSize: 13, fontWeight: 700,
-                  letterSpacing: '0.12em', textTransform: 'uppercase', cursor: 'pointer',
-                  textShadow: '0 1px 2px rgba(0,0,0,0.3)', boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
-                  opacity: isSubmitting ? 0.6 : 1,
-                }}
-              >
-                {isSubmitting ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <Loader2 className="h-5 w-5 animate-spin" />
-                    Processing...
-                  </span>
-                ) : total === 0 ? (
-                  'Claim Ticket ✦'
-                ) : (
-                  `Complete & Pay $${total} ✦`
-                )}
-              </button>
+              {availableAddons.map((addon) => {
+                const key = addon.product_key as 'hoa' | 'wmn' | 'vetted_va' | 'vip_luncheon'
+                if (!['hoa', 'wmn', 'vetted_va', 'vip_luncheon'].includes(key)) return null
+                const isGenderLocked = !!(addon.gender_lock && gender && gender !== addon.gender_lock)
+                const isTicketLocked = key === 'vip_luncheon' && !vipLuncheonEligible
+                const isLocked = isGenderLocked || isTicketLocked
+                const selected = addAddons[key]
+                const sale = getAddonSaleInfo(addon, allPrices)
+                return (
+                  <label
+                    key={addon.id}
+                    className="flex items-center gap-3 py-3 transition-colors"
+                    style={{
+                      color: '#F4E6CA',
+                      opacity: isLocked ? 0.5 : 1,
+                      cursor: isLocked ? 'not-allowed' : 'pointer',
+                      borderTop: '1px solid #D4A85A22',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      disabled={isLocked}
+                      onChange={() => toggleAddAddon(key)}
+                      className="h-4 w-4 cursor-pointer accent-[#A0282A] flex-shrink-0"
+                    />
+                    <span className="font-semibold text-sm">{addon.label}</span>
+                    {sale && (
+                      <span className="text-[10px] uppercase tracking-wider font-semibold whitespace-nowrap" style={{ color: '#D4A85A' }}>
+                        Early-Bird until {formatSaleEndDate(sale.earlyBirdEndAt)}
+                      </span>
+                    )}
+                    {isGenderLocked && (
+                      <span className="text-[10px] italic whitespace-nowrap" style={{ color: '#A0282A' }}>
+                        (Women only)
+                      </span>
+                    )}
+                    {isTicketLocked && (
+                      <span className="text-[10px] italic whitespace-nowrap" style={{ color: '#A0282A' }}>
+                        (VIP only)
+                      </span>
+                    )}
+                    <span className="ml-auto text-sm font-bold flex items-baseline gap-1.5 whitespace-nowrap" style={{ color: '#F4E6CA' }}>
+                      {sale && (
+                        <span className="line-through opacity-50 font-normal" style={{ color: '#D4A85A' }}>
+                          ${sale.regularPrice}
+                        </span>
+                      )}
+                      <span>{addon.price === 0 ? 'Free' : `$${addon.price}`}</span>
+                    </span>
+                  </label>
+                )
+              })}
             </div>
           </div>
+
+          {/* Bring a Guest — full-width button at bottom */}
+          <div className="mb-6">
+            <h3 className="font-bold text-base mb-3" style={{ color: '#F4E6CA' }}>
+              Bring a Guest
+            </h3>
+            {(guests.length > 0 || newGuests.length > 0) && (
+              <div className="space-y-2 mb-3">
+                {guests.map((g) => {
+                  // Existing-guest edit: 3 free add-ons are togglable
+                  // (gated by main attendee). HOA is shown for visibility
+                  // but read-only — it's set at add time because adding it
+                  // later requires a paid top-up.
+                  const editGates: Array<{
+                    key: 'hoa' | 'wmn' | 'vetted_va' | 'vip_luncheon'
+                    label: string
+                    enabled: boolean
+                    locked?: boolean
+                    lockedReason?: string
+                  }> = [
+                    {
+                      key: 'hoa',
+                      label: 'Hall of AIME',
+                      enabled: mainHasHoaEffective,
+                      locked: true,
+                      lockedReason: 'Set when the guest is added (paid line item)',
+                    },
+                    { key: 'wmn', label: 'WMN at Fuse', enabled: mainHasWmnEffective },
+                    { key: 'vetted_va', label: 'Vetted VA', enabled: mainHasVettedVaEffective },
+                    { key: 'vip_luncheon', label: 'VIP Luncheon', enabled: mainHasVipLuncheonEffective },
+                  ]
+                  return (
+                    <div
+                      key={g.id}
+                      className="p-2 rounded space-y-2"
+                      style={{ background: '#3a5a2022', border: '1px solid #3a5a2055' }}
+                    >
+                      {editingGuestId === g.id ? (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <input
+                              autoFocus
+                              value={editingName}
+                              onChange={(e) => setEditingName(e.target.value)}
+                              style={{ ...inputStyle, flex: 1 }}
+                              placeholder="Full name"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => saveEditGuest(g.id)}
+                              disabled={savingGuestId === g.id}
+                              className="text-xs px-3 py-1 rounded disabled:opacity-60"
+                              style={{
+                                background: '#A0282A',
+                                color: '#F4E6CA',
+                                cursor: savingGuestId === g.id ? 'wait' : 'pointer',
+                              }}
+                            >
+                              {savingGuestId === g.id ? '…' : 'Save'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={cancelEditGuest}
+                              className="text-xs px-2"
+                              style={{ color: '#8a7555' }}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                          <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs" style={{ color: '#F4E6CAcc' }}>
+                            {editGates.map((gate) => {
+                              const isLocked = !!gate.locked
+                              const disabled = !gate.enabled || isLocked
+                              return (
+                                <label
+                                  key={gate.key}
+                                  className={`inline-flex items-center gap-1.5 ${
+                                    disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+                                  }`}
+                                  title={
+                                    isLocked
+                                      ? gate.lockedReason
+                                      : gate.enabled
+                                      ? ''
+                                      : `Add ${gate.label} for yourself to enable for this guest`
+                                  }
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={
+                                      isLocked
+                                        ? !!g[`has_${gate.key === 'hoa' ? 'hall_of_aime' : gate.key === 'wmn' ? 'wmn_at_fuse' : gate.key}` as keyof typeof g]
+                                        : gate.enabled && editingAddons[gate.key]
+                                    }
+                                    disabled={disabled}
+                                    onChange={() => !disabled && toggleEditingAddon(gate.key)}
+                                    className="h-3.5 w-3.5 accent-[#A0282A]"
+                                  />
+                                  {gate.label}
+                                </label>
+                              )
+                            })}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 text-sm" style={{ color: '#F4E6CA' }}>
+                            {/* Matches the non-member sign-up format:
+                                "Name — General Admission (addon · addon)" */}
+                            {(() => {
+                              const addonList = [
+                                g.has_hall_of_aime && 'Hall of AIME',
+                                g.has_wmn_at_fuse && 'WMN',
+                                g.has_vetted_va && 'Vetted VA',
+                                g.has_vip_luncheon && 'VIP Luncheon',
+                              ]
+                                .filter(Boolean)
+                                .join(' · ')
+                              const ticketLabel =
+                                TICKET_LABELS[g.ticket_type] || g.ticket_type
+                              return (
+                                <>
+                                  {g.full_name} — {ticketLabel}
+                                  {addonList && ` (${addonList})`}
+                                </>
+                              )
+                            })()}
+                            {g.is_included && (
+                              <span className="ml-2 text-xs" style={{ color: '#4a7a2a' }}>(included)</span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => startEditGuest(g)}
+                            className="text-xs underline"
+                            style={{ color: '#D4A85A' }}
+                          >
+                            Edit
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+                {newGuests.map((g) => {
+                  const mainAddonGates: Array<{
+                    key: 'hoa' | 'wmn' | 'vetted_va' | 'vip_luncheon'
+                    label: string
+                    enabled: boolean
+                  }> = [
+                    { key: 'hoa', label: 'Hall of AIME', enabled: mainHasHoaEffective },
+                    { key: 'wmn', label: 'WMN at Fuse', enabled: mainHasWmnEffective },
+                    { key: 'vetted_va', label: 'Vetted VA', enabled: mainHasVettedVaEffective },
+                    { key: 'vip_luncheon', label: 'VIP Luncheon', enabled: mainHasVipLuncheonEffective },
+                  ]
+                  return (
+                    <div
+                      key={g.id}
+                      className="rounded-lg p-3 space-y-2"
+                      style={{ background: '#202F6055', border: '1px solid #D4A85A33' }}
+                    >
+                      <div className="flex gap-2 items-start">
+                        <input
+                          placeholder="First name"
+                          value={g.firstName}
+                          onChange={(e) => updateNewGuestRow(g.id, 'firstName', e.target.value)}
+                          style={inputStyle}
+                        />
+                        <input
+                          placeholder="Last name"
+                          value={g.lastName}
+                          onChange={(e) => updateNewGuestRow(g.id, 'lastName', e.target.value)}
+                          style={inputStyle}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => removeNewGuestRow(g.id)}
+                          className="text-xs px-2 self-center"
+                          style={{ color: '#A0282A' }}
+                          aria-label="Remove"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs" style={{ color: '#F4E6CAcc' }}>
+                        {mainAddonGates.map((gate) => (
+                          <label
+                            key={gate.key}
+                            className={`inline-flex items-center gap-1.5 ${
+                              gate.enabled ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'
+                            }`}
+                            title={gate.enabled ? '' : `Add ${gate.label} for yourself to enable for this guest`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={gate.enabled && g.addons[gate.key]}
+                              disabled={!gate.enabled}
+                              onChange={() => gate.enabled && toggleNewGuestAddon(g.id, gate.key)}
+                              className="h-3.5 w-3.5 accent-[#A0282A]"
+                            />
+                            {gate.label}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={addNewGuestRow}
+              className="w-full py-3 font-bold text-sm uppercase tracking-wider rounded-lg transition-colors"
+              style={{
+                background: '#D4A85A',
+                color: '#3A1F1A',
+                letterSpacing: '0.1em',
+              }}
+            >
+              + Add a Guest
+            </button>
+          </div>
+        </div>
+
+        {/* RIGHT — order summary for pending changes */}
+        <div className="lg:sticky lg:top-4 lg:self-start">
+          <OrderSummary
+            title="Order Summary"
+            lineItems={pendingOrderLines}
+            totalCents={pendingTotalCents}
+            paymentMethod={paymentMethod}
+            paymentMethodLoading={paymentMethodLoading}
+            onUseDifferentCard={() => setAddCardOpen(true)}
+            onPurchase={handleSaveChanges}
+            purchaseLabel={pendingTotalCents > 0 ? 'Pay & Save' : 'Save Changes'}
+            isSubmitting={isSubmitting}
+            canPurchase={hasPendingChanges}
+            showPayment={pendingTotalCents > 0}
+          />
+        </div>
+      </div>
+
+      <AddCardModal
+        open={addCardOpen}
+        onOpenChange={setAddCardOpen}
+        onSuccess={() => {
+          // Refresh card on file so the consent line reflects the new card.
+          loadPaymentMethod()
+        }}
+      />
+    </div>
+  )
+}
+
+// ============================================================
+// OrderSummary — shared by Step2Panel and ManagePanel
+// ============================================================
+
+interface OrderSummaryLine {
+  label: string
+  /** 'included' renders as "Included", 0 renders as "Free", anything else as "$X.XX". */
+  amountCents: number | 'included'
+  /** Optional small subtitle below the label. */
+  hint?: string
+}
+
+interface OrderSummaryProps {
+  title?: string
+  lineItems: OrderSummaryLine[]
+  totalCents: number
+  paymentMethod: { brand: string; last4: string } | null
+  paymentMethodLoading: boolean
+  onUseDifferentCard: () => void
+  onPurchase: () => void
+  purchaseLabel: string
+  isSubmitting: boolean
+  canPurchase: boolean
+  /** Show the card-on-file consent line only when totalCents > 0. */
+  showPayment: boolean
+}
+
+function formatAmount(amountCents: number | 'included'): string {
+  if (amountCents === 'included') return 'Included'
+  if (amountCents === 0) return 'Free'
+  return `$${(amountCents / 100).toFixed(2)}`
+}
+
+// Fuse 2026 brand palette (from the FS26 logo):
+//   Cream / off-white     #F4E6CA
+//   Dark brown outline    #3A1F1A
+//   Texas red             #A0282A
+//   Texas blue            #2B4B8C
+//   Gold / tan accent     #D4A85A
+//   Hero navy             #021649
+
+function OrderSummary({
+  title = 'Order Summary',
+  lineItems,
+  totalCents,
+  paymentMethod,
+  paymentMethodLoading,
+  onUseDifferentCard,
+  onPurchase,
+  purchaseLabel,
+  isSubmitting,
+  canPurchase,
+  showPayment,
+}: OrderSummaryProps) {
+  return (
+    <div
+      className="rounded-xl shadow-lg p-6"
+      style={{ background: '#F4E6CA', border: '1px solid #D4A85A' }}
+    >
+      <h3
+        className="text-lg font-bold mb-4 pb-3 uppercase tracking-wider"
+        style={{ color: '#A0282A', borderBottom: '2px solid #D4A85A88' }}
+      >
+        {title}
+      </h3>
+
+      <div className="space-y-2 mb-4">
+        {lineItems.length === 0 ? (
+          <p className="text-sm italic" style={{ color: '#8a7050' }}>
+            Add a guest or add-on to get started.
+          </p>
+        ) : (
+          lineItems.map((item, idx) => (
+            <div key={idx} className="flex items-start justify-between gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="text-sm" style={{ color: '#3A1F1A' }}>
+                  {item.label}
+                </div>
+                {item.hint && (
+                  <div className="text-xs mt-0.5" style={{ color: '#8a7050' }}>
+                    {item.hint}
+                  </div>
+                )}
+              </div>
+              <div
+                className="text-sm font-semibold whitespace-nowrap"
+                style={{
+                  color:
+                    item.amountCents === 'included' || item.amountCents === 0
+                      ? '#3a5a20'
+                      : '#3A1F1A',
+                }}
+              >
+                {formatAmount(item.amountCents)}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      <div
+        className="flex items-center justify-between pt-3 mb-4"
+        style={{ borderTop: '2px solid #D4A85A88' }}
+      >
+        <span className="font-bold text-base" style={{ color: '#3A1F1A' }}>
+          Total
+        </span>
+        <span className="font-bold text-xl" style={{ color: '#A0282A' }}>
+          ${(totalCents / 100).toFixed(2)}
+        </span>
+      </div>
+
+      {showPayment && (
+        <div
+          className="mb-3 px-3 py-2 rounded text-xs flex items-center justify-between gap-2"
+          style={{ background: '#ffffff66', border: '1px solid #D4A85A88' }}
+        >
+          <div className="flex items-center gap-2" style={{ color: '#3A1F1A' }}>
+            <CreditCard className="h-4 w-4" />
+            {paymentMethodLoading ? (
+              <span style={{ color: '#8a7050' }}>Loading payment method…</span>
+            ) : paymentMethod ? (
+              <span>
+                Charge to <strong>{paymentMethod.brand}</strong> ending{' '}
+                <strong>•••• {paymentMethod.last4}</strong>
+              </span>
+            ) : (
+              <span style={{ color: '#A0282A' }}>No card on file</span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={onUseDifferentCard}
+            className="text-xs underline whitespace-nowrap"
+            style={{ color: '#A0282A' }}
+          >
+            {paymentMethod ? 'Use a different card' : 'Add a card'}
+          </button>
         </div>
       )}
+
+      <button
+        type="button"
+        onClick={onPurchase}
+        disabled={!canPurchase || isSubmitting}
+        className="w-full px-4 py-3 font-bold text-sm rounded-full transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+        style={{
+          background: '#A0282A',
+          color: '#F4E6CA',
+          border: '1px solid #3A1F1A',
+          letterSpacing: '0.1em',
+          textTransform: 'uppercase',
+        }}
+      >
+        {isSubmitting ? (
+          <span className="inline-flex items-center justify-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Processing…
+          </span>
+        ) : (
+          purchaseLabel
+        )}
+      </button>
     </div>
   )
 }

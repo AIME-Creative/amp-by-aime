@@ -50,7 +50,16 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const stripePriceId = subscriptionPlan.stripe_price_id
+    // Dev override: when STRIPE_TEST_PRICE_<TIER>_<PERIOD> env vars are
+    // set, prefer those over the DB value so dev can run against Stripe
+    // test mode without mutating the shared prod subscription_plans
+    // rows. Prod env never sets these → falls back to DB unchanged.
+    const envKey = `STRIPE_TEST_PRICE_${planTier.toUpperCase()}_${billingInterval.toUpperCase()}`
+    const envOverridePriceId = process.env[envKey]
+    const stripePriceId = envOverridePriceId || subscriptionPlan.stripe_price_id
+    if (envOverridePriceId) {
+      console.log(`Using ${envKey} override (${envOverridePriceId}) instead of DB price ${subscriptionPlan.stripe_price_id}`)
+    }
 
     const { data: profile } = await supabase
       .from('profiles')

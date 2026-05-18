@@ -26,6 +26,11 @@ interface SidebarProps {
     avatar_url?: string
   }
   userRole?: string
+  fuseActiveEventYear?: number
+  fuseActiveEventEndDate?: string | null
+  fuseTicketClaimedYear?: number | null
+  /** Pre-go-live: when false, the Fuse manage link is admin-only. */
+  fuseVisible?: boolean
 }
 
 const navItems = [
@@ -41,7 +46,14 @@ const navItems = [
 // Navigation items visible to partner vendors and lenders
 const PARTNER_NAV_ITEMS = ['Resources', 'Lenders', 'Market']
 
-export default function Sidebar({ user, userRole }: SidebarProps) {
+export default function Sidebar({
+  user,
+  userRole,
+  fuseActiveEventYear,
+  fuseActiveEventEndDate,
+  fuseTicketClaimedYear,
+  fuseVisible = true,
+}: SidebarProps) {
   const [isCollapsed, setIsCollapsed] = useState(false)
   const pathname = usePathname()
 
@@ -52,6 +64,19 @@ export default function Sidebar({ user, userRole }: SidebarProps) {
   const filteredNavItems = isPartner
     ? navItems.filter(item => PARTNER_NAV_ITEMS.includes(item.name))
     : navItems
+
+  // Show Fuse menu item only once the user has claimed/purchased a
+  // ticket for the active event, and only until the event ends.
+  const hasClaimed =
+    !!fuseActiveEventYear &&
+    fuseTicketClaimedYear === fuseActiveEventYear
+  const showFuseLink =
+    !isPartner &&
+    fuseVisible &&
+    hasClaimed &&
+    !!fuseActiveEventEndDate &&
+    new Date() <= new Date(`${fuseActiveEventEndDate}T23:59:59`)
+  const fuseLinkActive = pathname === '/dashboard/fuse-registration'
 
   const getInitials = (name?: string) => {
     if (!name) return user?.email?.[0]?.toUpperCase() || 'U'
@@ -133,6 +158,45 @@ export default function Sidebar({ user, userRole }: SidebarProps) {
             )
           })}
         </nav>
+
+        {/* Fuse banner — full-width edge-to-edge */}
+        {showFuseLink && (
+          <Link
+            href="/dashboard/fuse-registration"
+            className={`relative flex flex-row items-center ${
+              isCollapsed ? 'justify-center' : 'justify-start'
+            } gap-3 px-4 py-3 transition-all w-full overflow-hidden ${
+              fuseLinkActive ? 'ring-2 ring-inset ring-[#202F60]' : 'hover:brightness-95'
+            }`}
+            style={{
+              background: '#ffffff',
+              boxShadow: '0 -2px 8px rgba(0,0,0,0.25)',
+            }}
+          >
+            {/* Gold accent line */}
+            <div
+              className="absolute top-0 left-0 right-0 h-[2px]"
+              style={{
+                background:
+                  'linear-gradient(90deg, transparent, #D4A85A, #F4E6CA, #D4A85A, transparent)',
+              }}
+            />
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src="/assets/fuse/fuse-logo.png"
+              alt=""
+              className="h-6 w-auto flex-shrink-0"
+            />
+            {!isCollapsed && (
+              <span
+                className="font-bold text-[12px] uppercase tracking-wider whitespace-nowrap"
+                style={{ color: '#202F60' }}
+              >
+                {fuseActiveEventYear ? `Fuse ${fuseActiveEventYear}` : 'Fuse'}
+              </span>
+            )}
+          </Link>
+        )}
 
         {/* Settings & Collapse */}
         <div className="px-3 py-4 space-y-2 flex flex-col items-center">

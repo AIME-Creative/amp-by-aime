@@ -1,6 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import Stripe from 'stripe'
+import { pickActivePrice, planGuestPricing } from '@/lib/fuse/pricing'
+
+// Stripe Checkout supports either a pre-made price id or ad-hoc
+// price_data per line item. The admin builder emits both: pre-made
+// for fixed catalog items (main ticket, HOA), ad-hoc for guest
+// tickets that need tier-discounted rates.
+type CheckoutLineItem =
+  | { price: string; quantity: number }
+  | {
+      price_data: {
+        currency: 'usd'
+        product_data: { name: string }
+        unit_amount: number
+      }
+      quantity: number
+    }
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!)
 
@@ -43,11 +59,14 @@ export async function POST(request: NextRequest) {
     const customerEmail = email || registration.email
     const origin = request.headers.get('origin') || process.env.NEXT_PUBLIC_APP_URL || ''
 
-    // Build line items server-side from registration data + fuse_ticket_prices
+    // Build line items server-side from registration data + fuse_ticket_prices.
+    // Covers every chargeable line the user-facing finalize/top-up flows
+    // emit: main ticket (paid buyer / pending / upgraded), HOA on main,
+    // each paid guest ticket, and per-guest HOA (with VIP entitlement
+    // consuming the 2 free HOA: 1 on main, 1 on first guest).
     const buildLineItemsFromRegistration = async () => {
-      const items: { price: string; quantity: number }[] = []
+      const items: CheckoutLineItem[] = []
 
-      // Get the full registration with guests
       const { data: fullReg } = await supabase
         .from('fuse_registrations')
         .select('*, guests:fuse_registration_guests(*)')
@@ -56,7 +75,6 @@ export async function POST(request: NextRequest) {
 
       if (!fullReg) return items
 
-      // Fetch all prices for this event
       const { data: allPrices } = await supabase
         .from('fuse_ticket_prices')
         .select('*')
@@ -65,24 +83,109 @@ export async function POST(request: NextRequest) {
 
       if (!allPrices) return items
 
-      // GA ticket — find by tier or public
-      if (fullReg.purchase_type === 'purchased' && fullReg.ticket_type === 'general_admission') {
-        const gaPrice = allPrices.find(p => p.product_key === 'ga' && !p.tier && p.stripe_price_id)
-        if (gaPrice) items.push({ price: gaPrice.stripe_price_id!, quantity: 1 })
+      // Tier-based guest pricing rules (Premium 10% / Elite 20% / VIP 30%
+      // off regular GA, per spec). Needed for the member-rate guest
+      // line items below.
+      const { data: guestRules } = await supabase
+        .from('fuse_guest_pricing_rules')
+        .select('tier, base_product_key, discount_percent')
+        .eq('fuse_event_id', fullReg.fuse_event_id)
+
+      const { data: eventRow } = await supabase
+        .from('fuse_events')
+        .select('year')
+        .eq('id', fullReg.fuse_event_id)
+        .single()
+      const eventLabel = `Fuse ${eventRow?.year ?? ''}`.trim()
+
+      // ----------------------------------------------------------------
+      // Main ticket.
+      //   - 'purchased'/'pending' GA → charge active GA price
+      //   - 'purchased'/'pending' GA Plus → charge active GA Plus price
+      //   - 'upgraded' → swap GA → GA Plus; charge GA Plus
+      //   - 'claimed' → free (entitled)
+      // ----------------------------------------------------------------
+      const isMainPaid =
+        fullReg.purchase_type === 'purchased' ||
+        fullReg.purchase_type === 'pending' ||
+        fullReg.purchase_type === 'upgraded'
+      if (isMainPaid) {
+        const mainKey =
+          fullReg.ticket_type === 'general_admission_plus' ||
+          fullReg.purchase_type === 'upgraded'
+            ? 'general_admission_plus'
+            : 'ga'
+        const mainPrice = pickActivePrice(allPrices, mainKey, null)
+        if (mainPrice?.stripe_price_id) {
+          items.push({ price: mainPrice.stripe_price_id, quantity: 1 })
+        }
       }
 
-      // HOA — tier-specific or public
-      if (fullReg.has_hall_of_aime) {
-        const hoaPrice = allPrices.find(p => p.product_key === 'hoa' && p.tier === fullReg.tier && !p.is_included && p.stripe_price_id)
-          || allPrices.find(p => p.product_key === 'hoa' && !p.tier && p.stripe_price_id)
-        if (hoaPrice) items.push({ price: hoaPrice.stripe_price_id!, quantity: 1 })
+      // ----------------------------------------------------------------
+      // HOA on the main attendee. VIP membership includes it (no charge);
+      // everyone else pays the active-phase price.
+      // ----------------------------------------------------------------
+      const isVipClaim =
+        fullReg.purchase_type === 'claimed' && fullReg.ticket_type === 'vip'
+      const mainHoaIsFree = isVipClaim
+      if (fullReg.has_hall_of_aime && !mainHoaIsFree) {
+        const tierHoa = pickActivePrice(allPrices, 'hoa', fullReg.tier)
+        const hoaPrice =
+          (tierHoa && !tierHoa.is_included && tierHoa.stripe_price_id ? tierHoa : null)
+          ?? pickActivePrice(allPrices, 'hoa', null)
+        if (hoaPrice?.stripe_price_id) {
+          items.push({ price: hoaPrice.stripe_price_id, quantity: 1 })
+        }
       }
 
-      // Guest tickets (non-included)
-      const paidGuests = fullReg.guests?.filter((g: any) => !g.is_included) || []
-      if (paidGuests.length > 0) {
-        const guestPrice = allPrices.find(p => p.product_key === 'guest' && p.stripe_price_id)
-        if (guestPrice) items.push({ price: guestPrice.stripe_price_id!, quantity: paidGuests.length })
+      // ----------------------------------------------------------------
+      // Guests. Tier-discounted member rate (or public rate for non-tier
+      // rows) — shared logic with the user-facing flow via
+      // planGuestPricing. Already-included guests (VIP first-guest slot)
+      // are skipped via `existingIncludedCount`, and we feed in only
+      // the non-included guests as "new" so they get priced.
+      // ----------------------------------------------------------------
+      const guests = fullReg.guests || []
+      const includedGuestCount = guests.filter((g: any) => g.is_included).length
+      const paidGuestRows = guests.filter((g: any) => !g.is_included)
+      const guestPlan = planGuestPricing({
+        tier: fullReg.tier ?? null,
+        rules: guestRules ?? null,
+        prices: allPrices,
+        existingIncludedCount: includedGuestCount,
+        newGuests: paidGuestRows.map((g: any) => ({
+          full_name: g.full_name,
+          ticket_type: g.ticket_type,
+        })),
+        eventLabel,
+      })
+      for (const line of guestPlan.stripeLineItems) {
+        items.push(line as CheckoutLineItem)
+      }
+
+      // ----------------------------------------------------------------
+      // Per-guest HOA. VIP entitlement gives 2 free HOA across the
+      // party (1 already credited to main, 1 to the first guest who has
+      // it). Subsequent guests with HOA pay.
+      // ----------------------------------------------------------------
+      const hoaPriceForGuests = pickActivePrice(allPrices, 'hoa', null)
+      if (hoaPriceForGuests?.stripe_price_id) {
+        let vipGuestHoaFreeRemaining = isVipClaim ? 1 : 0
+        let paidGuestHoaCount = 0
+        for (const g of guests) {
+          if (!g.has_hall_of_aime) continue
+          if (vipGuestHoaFreeRemaining > 0) {
+            vipGuestHoaFreeRemaining -= 1
+            continue
+          }
+          paidGuestHoaCount += 1
+        }
+        if (paidGuestHoaCount > 0) {
+          items.push({
+            price: hoaPriceForGuests.stripe_price_id,
+            quantity: paidGuestHoaCount,
+          })
+        }
       }
 
       return items

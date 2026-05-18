@@ -3,6 +3,9 @@ import { redirect } from 'next/navigation'
 import { FuseClaimPage } from '@/components/dashboard/FuseClaimPage'
 import { getImpersonationSettings } from '@/lib/impersonation-server'
 import { getViewAsSettings } from '@/lib/view-as-server'
+import { pickActivePrices } from '@/lib/fuse/pricing'
+import { getFuseEligibility } from '@/lib/fuse/eligibility'
+import { canSeeFuse } from '@/lib/fuse/visibility'
 
 export default async function FuseRegistrationPage() {
   const supabase = await createClient()
@@ -26,7 +29,7 @@ export default async function FuseRegistrationPage() {
   // Get user profile
   const { data: profile } = await supabase
     .from('profiles')
-    .select('id, email, full_name, phone, company, plan_tier, fuse_ticket_claimed_year, gender, is_admin')
+    .select('id, email, full_name, phone, company, plan_tier, billing_period, fuse_ticket_claimed_year, gender, is_admin')
     .eq('id', effectiveUserId)
     .single()
 
@@ -34,14 +37,34 @@ export default async function FuseRegistrationPage() {
     redirect('/dashboard')
   }
 
-  const isAdmin = profile.is_admin === true
+  // Admin-ness must come from the ORIGINAL session user, not the
+  // impersonated profile. Otherwise an admin impersonating a non-admin
+  // gets locked out of the page they're trying to QA pre-go-live.
+  // (Matches the pattern in app/dashboard/layout.tsx.)
+  let isAdmin = profile.is_admin === true
+  if (isImpersonating) {
+    const { data: originalAdmin } = await supabase
+      .from('profiles')
+      .select('is_admin')
+      .eq('id', user.id)
+      .single()
+    isAdmin = originalAdmin?.is_admin === true
+  }
 
-  // Admin-only for now — not live for members yet
-  if (!isAdmin) {
+  // Pre-go-live kill switch — non-admins bounce until FUSE_LIVE=true.
+  if (!canSeeFuse(isAdmin)) {
     redirect('/dashboard')
   }
 
   const eligibleTiers = ['Premium', 'Elite', 'VIP']
+
+  // Eligibility: annual eligible tier (claim flow) OR monthly eligible
+  // tier (buy flow). Anyone else bounces to /dashboard. Admins bypass
+  // so they can preview either variant regardless of their own plan.
+  const eligibility = getFuseEligibility(profile.plan_tier, profile.billing_period)
+  if (!isAdmin && eligibility.kind === 'none') {
+    redirect('/dashboard')
+  }
 
   // Get active Fuse event
   const { data: activeEvent } = await supabase
@@ -54,13 +77,42 @@ export default async function FuseRegistrationPage() {
     redirect('/dashboard')
   }
 
-  // Check for existing registration
-  const { data: existingRegistration } = await supabase
+  // Check for existing registration (and its guests for the manage panel)
+  let { data: existingRegistration } = await supabase
     .from('fuse_registrations')
-    .select('id, ticket_type, has_hall_of_aime, has_wmn_at_fuse')
+    .select(
+      'id, ticket_type, purchase_type, has_hall_of_aime, has_wmn_at_fuse, has_vetted_va, has_vip_luncheon, step_completed, guests:fuse_registration_guests(id, full_name, ticket_type, is_included, has_hall_of_aime, has_wmn_at_fuse, has_vetted_va, has_vip_luncheon)',
+    )
     .eq('fuse_event_id', activeEvent.id)
     .eq('user_id', effectiveUserId)
     .single()
+
+  // Monthly buyer with no registration yet: auto-create a default GA
+  // reservation so they land directly on the unified checkout instead
+  // of a separate ticket-picker landing card. They can swap to GA Plus
+  // inline via the "Add Upgrade to Order" card.
+  if (!existingRegistration && eligibility.kind === 'buy') {
+    const { data: created } = await supabase
+      .from('fuse_registrations')
+      .insert({
+        fuse_event_id: activeEvent.id,
+        user_id: effectiveUserId,
+        full_name: profile.full_name ?? '',
+        email: profile.email,
+        phone: profile.phone ?? null,
+        company: profile.company ?? null,
+        ticket_type: 'general_admission',
+        tier: profile.plan_tier,
+        purchase_type: 'purchased',
+        step_completed: 'claim',
+        registration_source: 'dashboard_buy',
+      })
+      .select(
+        'id, ticket_type, purchase_type, has_hall_of_aime, has_wmn_at_fuse, has_vetted_va, has_vip_luncheon, step_completed, guests:fuse_registration_guests(id, full_name, ticket_type, is_included, has_hall_of_aime, has_wmn_at_fuse, has_vetted_va, has_vip_luncheon)',
+      )
+      .single()
+    existingRegistration = created
+  }
 
   // Fetch tier-specific prices + universal add-ons (tier IS NULL, like WMN)
   const effectiveTier = profile.plan_tier && eligibleTiers.includes(profile.plan_tier)
@@ -85,12 +137,31 @@ export default async function FuseRegistrationPage() {
     .eq('is_active', true)
     .order('sort_order')
 
-  // Merge: tier prices + universal add-ons not already in tier prices
+  // Merge: tier prices + universal add-ons not already in tier prices.
+  // Dedupe public addons by phase-active picking so products with both
+  // early-bird and regular rows (e.g. HOA) only render once with the
+  // currently-active price.
   const tierProductKeys = (tierPrices || []).map((p) => p.product_key)
+  const activePublicAddons = pickActivePrices(universalAddons || [], null)
   const mergedPrices = [
     ...(tierPrices || []),
-    ...(universalAddons || []).filter((a) => !tierProductKeys.includes(a.product_key)),
+    ...activePublicAddons.filter((a) => !tierProductKeys.includes(a.product_key)),
   ]
+
+  // Full price catalog + guest pricing rules for client-side order-summary math.
+  // planGuestPricing (used in OrderSummary) needs the regular public GA row to
+  // compute the member-discount base, which isn't always in `mergedPrices`.
+  const { data: allPriceRows } = await supabase
+    .from('fuse_ticket_prices')
+    .select('*')
+    .eq('fuse_event_id', activeEvent.id)
+    .eq('is_active', true)
+    .order('sort_order')
+
+  const { data: guestPricingRules } = await supabase
+    .from('fuse_guest_pricing_rules')
+    .select('tier, base_product_key, discount_percent')
+    .eq('fuse_event_id', activeEvent.id)
 
   return (
     <FuseClaimPage
@@ -102,11 +173,14 @@ export default async function FuseRegistrationPage() {
         phone: profile.phone,
         company: profile.company,
         plan_tier: profile.plan_tier,
+        billing_period: profile.billing_period,
         gender: profile.gender,
       }}
       existingRegistration={existingRegistration}
       isAdmin={isAdmin}
       tierPrices={mergedPrices}
+      allPrices={allPriceRows ?? []}
+      guestPricingRules={guestPricingRules ?? []}
     />
   )
 }

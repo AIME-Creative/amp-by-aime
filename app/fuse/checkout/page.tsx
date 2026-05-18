@@ -1,9 +1,21 @@
+import { notFound } from 'next/navigation'
 import { createClient } from '@supabase/supabase-js'
 import { FuseCheckout } from '@/components/fuse/FuseCheckout'
+import { pickActivePrice, pickActivePrices } from '@/lib/fuse/pricing'
+import { isFuseLive } from '@/lib/fuse/visibility'
 
 export const dynamic = 'force-dynamic'
 
 export default async function FuseCheckoutPage() {
+  // Pre-go-live: the public Fuse checkout doesn't exist as far as
+  // visitors are concerned. There's no logged-in user here to derive
+  // admin status from, so the gate is the env var alone. Admins who
+  // need to QA this surface should flip FUSE_LIVE temporarily or test
+  // against a staging env that has it set.
+  if (!isFuseLive()) {
+    notFound()
+  }
+
   const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!
@@ -66,39 +78,10 @@ export default async function FuseCheckoutPage() {
     .eq('is_active', true)
     .order('sort_order')
 
-  // Determine if early bird is active
-  const now = new Date()
-  const earlyBirdGA = prices?.find(
-    (p) => p.product_key === 'ga' && p.pricing_phase === 'early_bird'
-  )
-  const regularGA = prices?.find(
-    (p) => p.product_key === 'ga' && p.pricing_phase === 'regular'
-  )
-
-  let isEarlyBird = false
-  if (earlyBirdGA) {
-    const start = earlyBirdGA.phase_start_at ? new Date(earlyBirdGA.phase_start_at) : null
-    const end = earlyBirdGA.phase_end_at ? new Date(earlyBirdGA.phase_end_at) : null
-    // Early bird is active if: no dates set (always active until set), or current time is within range
-    if (!start && !end) {
-      isEarlyBird = true // No dates = early bird is active by default
-    } else if (start && end) {
-      isEarlyBird = now >= start && now <= end
-    } else if (start && !end) {
-      isEarlyBird = now >= start
-    } else if (!start && end) {
-      isEarlyBird = now <= end
-    }
-  }
-
-  // Pick the active GA price
-  const activeGA = isEarlyBird && earlyBirdGA ? earlyBirdGA : regularGA
-
-  // Build the prices array for the component (active GA + addons)
-  const publicPrices = [
-    ...(activeGA ? [activeGA] : []),
-    ...(prices?.filter((p) => p.is_addon) || []),
-  ]
+  // Pick one active price row per public product (phase-aware, deduped).
+  const publicPrices = pickActivePrices(prices, null)
+  const activeGA = pickActivePrice(prices, 'ga', null)
+  const isEarlyBird = activeGA?.pricing_phase === 'early_bird'
 
   return (
     <FuseCheckout

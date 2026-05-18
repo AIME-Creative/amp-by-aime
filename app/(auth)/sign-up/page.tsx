@@ -289,6 +289,9 @@ function CheckoutForm({
       }
 
       const supabase = createClient()
+      let userId: string | null = null
+      let isReturningFromFailedPayment = false
+
       const { data, error } = await supabase.auth.signUp({
         email: formData.email,
         password: formData.password,
@@ -301,33 +304,66 @@ function CheckoutForm({
         },
       })
 
-      if (error) throw error
-      if (!data.user?.id) throw new Error('Account creation failed')
+      if (error) {
+        // The auth user was created on a previous attempt but the
+        // payment didn't go through, so we orphaned an account. Try
+        // signing in with the supplied password — if it works, the
+        // user is the same person retrying, and we can continue
+        // straight into the payment step.
+        const isAlreadyRegistered =
+          error.status === 422 ||
+          /already.*registered|already.*exists/i.test(error.message)
+        if (!isAlreadyRegistered) throw error
 
-      const userId = data.user.id
+        const { data: signInData, error: signInError } =
+          await supabase.auth.signInWithPassword({
+            email: formData.email,
+            password: formData.password,
+          })
+        if (signInError || !signInData.user?.id) {
+          setPaymentError(
+            'This email already has an account. Log in to continue checkout.',
+          )
+          setIsSubmitting(false)
+          return
+        }
+        userId = signInData.user.id
+        isReturningFromFailedPayment = true
+      } else if (!data.user?.id) {
+        throw new Error('Account creation failed')
+      } else {
+        userId = data.user.id
+      }
+
       const attribution = getStoredAttribution()
 
-      try {
-        await fetch('/api/ghl/create-contact', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId,
-            email: formData.email,
-            fullName: formData.fullName,
-            phone: formData.phone,
-            role: 'loan_officer',
-            attribution,
-          }),
-        })
-      } catch (ghlError) {
-        console.error('GHL contact creation failed:', ghlError)
+      if (!isReturningFromFailedPayment) {
+        try {
+          await fetch('/api/ghl/create-contact', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId,
+              email: formData.email,
+              fullName: formData.fullName,
+              phone: formData.phone,
+              role: 'loan_officer',
+              attribution,
+            }),
+          })
+        } catch (ghlError) {
+          console.error('GHL contact creation failed:', ghlError)
+        }
       }
 
       await supabase
         .from('profiles')
         .update({
-          onboarding_step: 'complete_profile',
+          // Fuse 2026 wedge: drop into the claim/buy step between
+          // checkout and complete-profile. The wedge auto-skips
+          // ineligible users (no tier / expired event) straight to
+          // complete-profile, so this is safe for all sign-ups.
+          onboarding_step: 'claim_fuse_ticket',
           ...(attribution ? { attribution } : {}),
         })
         .eq('id', userId)
@@ -348,8 +384,38 @@ function CheckoutForm({
         return
       }
 
+      // Compute the canonical plan tier label up front. We need it for
+      // BOTH paths below: the no-charge path (100%-off coupon → no
+      // PaymentIntent fires → confirmPayment skipped) AND the paid path.
+      // Without this UPDATE the trigger's default plan_tier='None' stays
+      // on the profile and middleware bounces the user to select-plan.
+      // Stripe's customer.subscription.updated webhook eventually
+      // reaffirms these values, but it can't beat the redirect.
+      const planTierLabel =
+        selectedPlan === 'vip' ? 'VIP'
+        : selectedPlan === 'elite' ? 'Elite'
+        : selectedPlan === 'premium' ? 'Premium'
+        : null
+      const writeProfileAfterCheckout = async () => {
+        if (!planTierLabel) return
+        await supabase
+          .from('profiles')
+          .update({
+            plan_tier: planTierLabel,
+            billing_period: billingInterval,
+            subscription_status: 'active',
+            stripe_subscription_status: 'active',
+          })
+          .eq('id', userId)
+      }
+
       if (!checkoutData.clientSecret) {
-        window.location.href = '/onboarding/complete-profile'
+        // 100%-off coupon path — Stripe doesn't issue a PaymentIntent
+        // because there's nothing to charge. The subscription is
+        // already active on Stripe's side; we just need to mirror that
+        // to our profile before redirecting.
+        await writeProfileAfterCheckout()
+        window.location.href = '/onboarding/claim-fuse-ticket'
         return
       }
 
@@ -357,7 +423,7 @@ function CheckoutForm({
         elements,
         clientSecret: checkoutData.clientSecret,
         confirmParams: {
-          return_url: `${window.location.origin}/onboarding/complete-profile`,
+          return_url: `${window.location.origin}/onboarding/claim-fuse-ticket`,
           payment_method_data: {
             billing_details: {
               name: formData.fullName || undefined,
@@ -384,7 +450,9 @@ function CheckoutForm({
         return
       }
 
-      window.location.href = '/onboarding/complete-profile'
+      await writeProfileAfterCheckout()
+
+      window.location.href = '/onboarding/claim-fuse-ticket'
     } catch (err: any) {
       toast.error(err.message || 'Failed to create account')
       setIsSubmitting(false)

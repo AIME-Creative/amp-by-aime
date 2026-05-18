@@ -1,11 +1,20 @@
+import { notFound } from 'next/navigation'
 import { createClient } from '@supabase/supabase-js'
 import { FuseCheckoutSuccess } from '@/components/fuse/FuseCheckoutSuccess'
+import { isFuseLive } from '@/lib/fuse/visibility'
 
 interface Props {
   searchParams: Promise<{ registration_id?: string }>
 }
 
 export default async function FuseCheckoutSuccessPage({ searchParams }: Props) {
+  // Pre-go-live: the public checkout success page is part of the same
+  // surface as /fuse/checkout. Gate by env var. Existing rows in the
+  // DB stay reachable the moment FUSE_LIVE flips on.
+  if (!isFuseLive()) {
+    notFound()
+  }
+
   const params = await searchParams
   const registrationId = params.registration_id
 

@@ -753,6 +753,109 @@ export async function POST(request: NextRequest) {
         break
       }
 
+      case 'payment_intent.succeeded': {
+        // Fuse reconciler — closes the residual gap where a Fuse
+        // PaymentIntent succeeded but our DB writes failed (or the
+        // client never received the success response and bailed).
+        //
+        // Filters strictly to our own intents via metadata.type. Idempotent:
+        // every branch checks before writing, so replays / out-of-order
+        // deliveries are safe. Non-Fuse intents fall through to default.
+        const pi = event.data.object as Stripe.PaymentIntent
+        if (pi.metadata?.type !== 'fuse_claim_addon') break
+
+        const source = pi.metadata?.source
+        const registrationId = pi.metadata?.registration_id
+        if (!registrationId) {
+          // claim+finalize one-shot path creates the registration row
+          // server-side in the same request that creates the PI, so
+          // there's no row to reconcile against here. If that write
+          // failed, the user-facing route already 500'd.
+          break
+        }
+
+        const { data: reg } = await supabaseAdmin
+          .from('fuse_registrations')
+          .select(
+            'id, user_id, fuse_event_id, ticket_type, purchase_type, step_completed',
+          )
+          .eq('id', registrationId)
+          .single()
+
+        if (!reg) {
+          console.warn(
+            `[fuse reconciler] PI ${pi.id} references registration ${registrationId} but row not found`,
+          )
+          break
+        }
+
+        // ----------------------------------------------------------------
+        // 1. Promote step_completed='claim' → 'finalized' if a finalize /
+        //    top-up / upgrade PI succeeded. Top-ups against an already-
+        //    finalized row are a no-op (registration stays 'finalized').
+        // ----------------------------------------------------------------
+        const isFinalizingSource =
+          source === 'finalize' ||
+          source === 'top-up' ||
+          source === 'upgrade-to-ga-plus'
+        const regUpdate: Record<string, unknown> = {}
+        if (isFinalizingSource && reg.step_completed !== 'finalized') {
+          regUpdate.step_completed = 'finalized'
+        }
+        // ----------------------------------------------------------------
+        // 2. Upgrade reconciliation — if the upgrade PI succeeded but
+        //    we never flipped ticket_type / purchase_type, do it now.
+        // ----------------------------------------------------------------
+        if (source === 'upgrade-to-ga-plus') {
+          if (reg.ticket_type !== 'general_admission_plus') {
+            regUpdate.ticket_type = 'general_admission_plus'
+          }
+          if (reg.purchase_type !== 'upgraded') {
+            regUpdate.purchase_type = 'upgraded'
+          }
+        }
+        if (Object.keys(regUpdate).length > 0) {
+          regUpdate.updated_at = new Date().toISOString()
+          const { error: updErr } = await supabaseAdmin
+            .from('fuse_registrations')
+            .update(regUpdate)
+            .eq('id', registrationId)
+          if (updErr) {
+            console.error(
+              `[fuse reconciler] failed to update registration ${registrationId}:`,
+              updErr,
+            )
+          } else {
+            console.log(
+              `[fuse reconciler] reconciled ${registrationId} from PI ${pi.id} (source=${source}):`,
+              regUpdate,
+            )
+          }
+        }
+
+        // ----------------------------------------------------------------
+        // 3. profiles.fuse_ticket_claimed_year — set if missing for this
+        //    member so the banner + sidebar key off it correctly. Only
+        //    touches rows where the value is still null (won't clobber
+        //    a more recent year).
+        // ----------------------------------------------------------------
+        if (reg.user_id) {
+          const { data: fuseEvent } = await supabaseAdmin
+            .from('fuse_events')
+            .select('year')
+            .eq('id', reg.fuse_event_id)
+            .single()
+          if (fuseEvent?.year) {
+            await supabaseAdmin
+              .from('profiles')
+              .update({ fuse_ticket_claimed_year: fuseEvent.year })
+              .eq('id', reg.user_id)
+              .is('fuse_ticket_claimed_year', null)
+          }
+        }
+        break
+      }
+
       default:
         // Unhandled event types are silently ignored
     }

@@ -35,6 +35,30 @@ import {
 } from '@/components/ui/select'
 import { toast } from 'sonner'
 import type { FuseEvent, FuseRegistration, FuseRegistrationGuest } from '@/types/database.types'
+import { pickActivePrice } from '@/lib/fuse/pricing'
+import { getFuseEligibility } from '@/lib/fuse/eligibility'
+
+const PURCHASE_TYPE_LABELS: Record<string, string> = {
+  claimed: 'Claimed (member benefit)',
+  purchased: 'Purchased (paid)',
+  pending: 'Pending payment',
+  // Legacy label — GA Plus was retired for Fuse 2026 and admins can no
+  // longer set 'upgraded' on new rows, but the badge still renders for
+  // any historical rows in the DB.
+  upgraded: 'Upgraded (legacy)',
+}
+
+const PURCHASE_TYPE_BADGE_CLASS: Record<string, string> = {
+  claimed: 'bg-teal-100 text-teal-800',
+  purchased: 'bg-yellow-100 text-yellow-800',
+  pending: 'bg-orange-100 text-orange-800',
+  upgraded: 'bg-purple-100 text-purple-800',
+}
+
+const STEP_COMPLETED_BADGE_CLASS: Record<string, string> = {
+  claim: 'bg-orange-100 text-orange-800',
+  finalized: 'bg-green-100 text-green-800',
+}
 
 interface FuseRegistrationManagerProps {
   events: FuseEvent[]
@@ -100,7 +124,9 @@ export function FuseRegistrationManager({
     })
   }
 
-  // Compute ticket counts across all registrations + guests (for current page/filters)
+  // Compute ticket counts across all registrations + guests (for current page/filters).
+  // Per-guest add-on flags are tallied alongside main-attendee flags so
+  // each chip in the summary header reflects the full attendee count.
   const ticketCounts = React.useMemo(() => {
     const counts = {
       total: 0,
@@ -110,6 +136,8 @@ export function FuseRegistrationManager({
       guests: 0,
       hallOfAime: 0,
       wmnAtFuse: 0,
+      vettedVa: 0,
+      vipLuncheon: 0,
     }
     for (const reg of registrations) {
       counts.total++
@@ -117,6 +145,8 @@ export function FuseRegistrationManager({
       else if (reg.ticket_type === 'vip') counts.vip++
       if (reg.has_hall_of_aime) counts.hallOfAime++
       if (reg.has_wmn_at_fuse) counts.wmnAtFuse++
+      if ((reg as any).has_vetted_va) counts.vettedVa++
+      if ((reg as any).has_vip_luncheon) counts.vipLuncheon++
       if (reg.guests) {
         for (const guest of reg.guests) {
           counts.total++
@@ -124,24 +154,33 @@ export function FuseRegistrationManager({
           if (guest.ticket_type === 'general_admission') counts.ga++
           else if (guest.ticket_type === 'vip') counts.vip++
           else if (guest.ticket_type === 'vip_guest') counts.vip++ // VIP guest counts as VIP for check-in
+          const g = guest as any
+          if (g.has_hall_of_aime) counts.hallOfAime++
+          if (g.has_wmn_at_fuse) counts.wmnAtFuse++
+          if (g.has_vetted_va) counts.vettedVa++
+          if (g.has_vip_luncheon) counts.vipLuncheon++
         }
       }
     }
     return counts
   }, [registrations])
 
-  // CSV Export — flat check-in list: one row per person
+  // CSV Export — flat check-in list: one row per person.
+  // Per-guest add-on columns mirror the main attendee columns so check-in
+  // can scan a single row to know what each person is entitled to.
   const handleExportCSV = useCallback(() => {
     const rows: string[][] = []
     rows.push([
       'Role', 'Name', 'Email', 'Phone', 'Company', 'Ticket Type',
-      'Tier', 'Purchase Type', 'Included w/ VIP', 'Hall of Aime', 'WMN at Fuse',
+      'Tier', 'Purchase Type', 'Step', 'Included w/ VIP',
+      'Hall of AIME', 'WMN at Fuse', 'Vetted VA', 'VIP Luncheon',
       'Primary Registrant', 'Primary Email', 'Source', 'Notes', 'Created At',
     ])
 
     let totalAttendees = 0
 
     for (const reg of registrations) {
+      const r = reg as any
       // Primary registrant row
       totalAttendees++
       rows.push([
@@ -153,10 +192,13 @@ export function FuseRegistrationManager({
         TICKET_TYPE_LABELS[reg.ticket_type] || reg.ticket_type,
         reg.tier || 'N/A',
         reg.purchase_type,
+        r.step_completed || '',
         '',
         reg.has_hall_of_aime ? 'Yes' : 'No',
         reg.has_wmn_at_fuse ? 'Yes' : 'No',
-        '', // no primary for primary
+        r.has_vetted_va ? 'Yes' : 'No',
+        r.has_vip_luncheon ? 'Yes' : 'No',
+        '', // primary linked to self
         '',
         reg.registration_source || '',
         reg.notes || '',
@@ -166,6 +208,7 @@ export function FuseRegistrationManager({
       // Guest rows — linked back to primary
       if (reg.guests) {
         for (const guest of reg.guests) {
+          const g = guest as any
           totalAttendees++
           rows.push([
             'Guest',
@@ -175,10 +218,13 @@ export function FuseRegistrationManager({
             '', // guests don't have company
             TICKET_TYPE_LABELS[guest.ticket_type] || guest.ticket_type,
             '', // guests don't have tier
-            '',
+            '', // guests don't have purchase_type
+            '', // guests don't have step_completed
             guest.is_included ? 'Yes' : 'No',
-            '', // guests don't have add-ons
-            '',
+            g.has_hall_of_aime ? 'Yes' : 'No',
+            g.has_wmn_at_fuse ? 'Yes' : 'No',
+            g.has_vetted_va ? 'Yes' : 'No',
+            g.has_vip_luncheon ? 'Yes' : 'No',
             reg.full_name, // linked to primary
             reg.email,
             '',
@@ -243,11 +289,31 @@ export function FuseRegistrationManager({
     setMemberSearch('')
     setMemberResults([])
 
-    // Auto-fill form
-    const eligibleTiers = ['Premium', 'Elite', 'VIP']
-    const tier = member.plan_tier && eligibleTiers.includes(member.plan_tier) ? member.plan_tier : ''
-    const ticketType = member.plan_tier === 'VIP' ? 'vip' : 'general_admission'
-    const purchaseType = tier ? 'claimed' : 'purchased'
+    // Use the same eligibility rules the user-facing flows apply:
+    //   - Annual eligible tier → claim (free entitled ticket)
+    //   - Monthly Premium/Elite/VIP → buy (GA default; admin can flip)
+    //   - Anyone else → manual purchase
+    const eligibility = getFuseEligibility(
+      member.plan_tier,
+      member.billing_period,
+    )
+
+    const tier = eligibility.kind === 'claim'
+      ? eligibility.planTier
+      : eligibility.kind === 'buy'
+      ? eligibility.planTier
+      : ''
+    const ticketType =
+      eligibility.kind === 'claim' && eligibility.planTier === 'VIP'
+        ? 'vip'
+        : 'general_admission'
+    const purchaseType =
+      eligibility.kind === 'claim'
+        ? 'claimed'
+        : eligibility.kind === 'buy'
+        ? 'pending'
+        : 'purchased'
+    const isVipClaim = eligibility.kind === 'claim' && eligibility.planTier === 'VIP'
 
     setFormData({
       ...formData,
@@ -258,16 +324,52 @@ export function FuseRegistrationManager({
       ticket_type: ticketType,
       tier,
       purchase_type: purchaseType,
-      has_hall_of_aime: member.plan_tier === 'VIP', // VIP gets HOA included
+      step_completed: 'claim',
+      // VIP membership includes 2 HOA tickets (member + 1 guest).
+      // Auto-populate both here so admin doesn't have to remember.
+      has_hall_of_aime: isVipClaim,
       has_wmn_at_fuse: false,
+      has_vetted_va: false,
+      has_vip_luncheon: false,
       notes: formData.notes,
-      guests: member.plan_tier === 'VIP'
-        ? [{ full_name: '', email: '', phone: '', ticket_type: 'vip_guest', is_included: true }]
+      guests: isVipClaim
+        ? [
+            blankGuest({
+              ticket_type: 'vip_guest',
+              is_included: true,
+              has_hall_of_aime: true,
+            }),
+          ]
         : [],
     })
   }
 
-  // Form data
+  // Form data — guest rows carry the same 4 add-on flags as the
+  // main registration; UI gates on the main row's flags so admins
+  // can't grant a guest an add-on the main attendee doesn't have.
+  type GuestRow = {
+    full_name: string
+    email: string
+    phone: string
+    ticket_type: string
+    is_included: boolean
+    has_hall_of_aime: boolean
+    has_wmn_at_fuse: boolean
+    has_vetted_va: boolean
+    has_vip_luncheon: boolean
+  }
+  const blankGuest = (overrides: Partial<GuestRow> = {}): GuestRow => ({
+    full_name: '',
+    email: '',
+    phone: '',
+    ticket_type: 'general_admission',
+    is_included: false,
+    has_hall_of_aime: false,
+    has_wmn_at_fuse: false,
+    has_vetted_va: false,
+    has_vip_luncheon: false,
+    ...overrides,
+  })
   const [formData, setFormData] = useState({
     full_name: '',
     email: '',
@@ -276,10 +378,16 @@ export function FuseRegistrationManager({
     ticket_type: 'general_admission',
     tier: '',
     purchase_type: 'purchased',
+    step_completed: 'claim' as 'claim' | 'finalized',
     has_hall_of_aime: false,
     has_wmn_at_fuse: false,
+    has_vetted_va: false,
+    has_vip_luncheon: false,
     notes: '',
-    guests: [] as { full_name: string; email: string; phone: string; ticket_type: string; is_included: boolean }[],
+    guests: [] as GuestRow[],
+    // Admin override — when true, bypasses the server-side eligibility
+    // gate (e.g. lets a monthly member be marked 'claimed' for a comp).
+    skip_eligibility_check: false,
   })
 
   // Fetch registrations when filters change
@@ -331,16 +439,28 @@ export function FuseRegistrationManager({
         ticket_type: registration.ticket_type,
         tier: registration.tier || '',
         purchase_type: registration.purchase_type,
+        step_completed:
+          ((registration as any).step_completed as 'claim' | 'finalized') || 'claim',
         has_hall_of_aime: registration.has_hall_of_aime,
         has_wmn_at_fuse: registration.has_wmn_at_fuse,
+        has_vetted_va: !!(registration as any).has_vetted_va,
+        has_vip_luncheon: !!(registration as any).has_vip_luncheon,
         notes: registration.notes || '',
-        guests: registration.guests?.map(g => ({
-          full_name: g.full_name,
-          email: g.email || '',
-          phone: g.phone || '',
-          ticket_type: g.ticket_type,
-          is_included: g.is_included,
-        })) || [],
+        guests:
+          registration.guests?.map((g) =>
+            blankGuest({
+              full_name: g.full_name,
+              email: g.email || '',
+              phone: g.phone || '',
+              ticket_type: g.ticket_type,
+              is_included: g.is_included,
+              has_hall_of_aime: !!(g as any).has_hall_of_aime,
+              has_wmn_at_fuse: !!(g as any).has_wmn_at_fuse,
+              has_vetted_va: !!(g as any).has_vetted_va,
+              has_vip_luncheon: !!(g as any).has_vip_luncheon,
+            }),
+          ) || [],
+        skip_eligibility_check: false,
       })
     } else {
       setEditingRegistration(null)
@@ -354,10 +474,14 @@ export function FuseRegistrationManager({
         ticket_type: 'general_admission',
         tier: '',
         purchase_type: 'purchased',
+        step_completed: 'claim',
         has_hall_of_aime: false,
         has_wmn_at_fuse: false,
+        has_vetted_va: false,
+        has_vip_luncheon: false,
         notes: '',
         guests: [],
+        skip_eligibility_check: false,
       })
     }
     setIsDialogOpen(true)
@@ -449,18 +573,20 @@ export function FuseRegistrationManager({
 
       const lineItems: { price: string; quantity: number }[] = []
 
-      // GA ticket (public price)
-      const gaPrice = prices.find((p: any) => p.product_key === 'ga' && !p.tier && p.stripe_price_id)
-      if (gaPrice && registration.ticket_type === 'general_admission') {
+      // GA ticket (public price, phase-aware)
+      const gaPrice = pickActivePrice(prices, 'ga', null)
+      if (gaPrice?.stripe_price_id && registration.ticket_type === 'general_admission') {
         lineItems.push({ price: gaPrice.stripe_price_id, quantity: 1 })
       }
 
-      // HOA
+      // HOA — tier first, fall back to public; phase-aware
       if (registration.has_hall_of_aime) {
         const tier = registration.tier
-        const hoaPrice = prices.find((p: any) => p.product_key === 'hoa' && p.tier === tier && p.stripe_price_id && !p.is_included)
-          || prices.find((p: any) => p.product_key === 'hoa' && !p.tier && p.stripe_price_id)
-        if (hoaPrice) lineItems.push({ price: hoaPrice.stripe_price_id, quantity: 1 })
+        const tierHoa = pickActivePrice(prices, 'hoa', tier ?? null)
+        const hoaPrice =
+          (tierHoa && !tierHoa.is_included && tierHoa.stripe_price_id ? tierHoa : null)
+          ?? pickActivePrice(prices, 'hoa', null)
+        if (hoaPrice?.stripe_price_id) lineItems.push({ price: hoaPrice.stripe_price_id, quantity: 1 })
       }
 
       // Guest tickets
@@ -571,10 +697,7 @@ export function FuseRegistrationManager({
   const addGuest = () => {
     setFormData({
       ...formData,
-      guests: [
-        ...formData.guests,
-        { full_name: '', email: '', phone: '', ticket_type: 'general_admission', is_included: false },
-      ],
+      guests: [...formData.guests, blankGuest()],
     })
   }
 
@@ -688,10 +811,16 @@ export function FuseRegistrationManager({
               {ticketCounts.guests} guests
             </span>
             {ticketCounts.hallOfAime > 0 && (
-              <Badge className="bg-amber-100 text-amber-800">{ticketCounts.hallOfAime} Hall of Aime</Badge>
+              <Badge className="bg-amber-100 text-amber-800">{ticketCounts.hallOfAime} Hall of AIME</Badge>
             )}
             {ticketCounts.wmnAtFuse > 0 && (
               <Badge className="bg-pink-100 text-pink-800">{ticketCounts.wmnAtFuse} WMN</Badge>
+            )}
+            {ticketCounts.vettedVa > 0 && (
+              <Badge className="bg-emerald-100 text-emerald-800">{ticketCounts.vettedVa} Vetted VA</Badge>
+            )}
+            {ticketCounts.vipLuncheon > 0 && (
+              <Badge className="bg-purple-100 text-purple-800">{ticketCounts.vipLuncheon} VIP Luncheon</Badge>
             )}
           </div>
         </div>
@@ -778,26 +907,50 @@ export function FuseRegistrationManager({
                       <td className="px-6 py-4 whitespace-nowrap">
                         <div className="flex flex-col gap-1">
                           {registration.has_hall_of_aime && (
-                            <Badge className="bg-amber-100 text-amber-800 text-xs">Hall of Aime</Badge>
+                            <Badge className="bg-amber-100 text-amber-800 text-xs">Hall of AIME</Badge>
                           )}
                           {registration.has_wmn_at_fuse && (
                             <Badge className="bg-pink-100 text-pink-800 text-xs">WMN at Fuse</Badge>
                           )}
-                          {!registration.has_hall_of_aime && !registration.has_wmn_at_fuse && (
+                          {(registration as any).has_vetted_va && (
+                            <Badge className="bg-emerald-100 text-emerald-800 text-xs">Vetted VA</Badge>
+                          )}
+                          {(registration as any).has_vip_luncheon && (
+                            <Badge className="bg-purple-100 text-purple-800 text-xs">VIP Luncheon</Badge>
+                          )}
+                          {!registration.has_hall_of_aime &&
+                            !registration.has_wmn_at_fuse &&
+                            !(registration as any).has_vetted_va &&
+                            !(registration as any).has_vip_luncheon && (
                             <span className="text-sm text-gray-400">-</span>
                           )}
                         </div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
-                        <Badge
-                          className={
-                            registration.purchase_type === 'claimed'
-                              ? 'bg-teal-100 text-teal-800'
-                              : 'bg-yellow-100 text-yellow-800'
-                          }
-                        >
-                          {registration.purchase_type === 'claimed' ? 'Claimed' : 'Purchased'}
-                        </Badge>
+                        <div className="flex flex-col gap-1">
+                          <Badge
+                            className={
+                              PURCHASE_TYPE_BADGE_CLASS[registration.purchase_type] ||
+                              'bg-gray-100 text-gray-800'
+                            }
+                          >
+                            {PURCHASE_TYPE_LABELS[registration.purchase_type] ||
+                              registration.purchase_type}
+                          </Badge>
+                          {(registration as any).step_completed && (
+                            <Badge
+                              className={`text-xs ${
+                                STEP_COMPLETED_BADGE_CLASS[
+                                  (registration as any).step_completed
+                                ] || 'bg-gray-100 text-gray-700'
+                              }`}
+                            >
+                              {(registration as any).step_completed === 'finalized'
+                                ? 'Finalized'
+                                : 'Claim'}
+                            </Badge>
+                          )}
+                        </div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         {hasGuests ? (
@@ -839,35 +992,57 @@ export function FuseRegistrationManager({
                       </td>
                     </tr>
                     {/* Guest accordion rows */}
-                    {isExpanded && registration.guests!.map((guest, gIdx) => (
-                      <tr key={`${registration.id}-guest-${gIdx}`} className="bg-gray-50/70">
-                        <td className="px-6 py-2.5 whitespace-nowrap">
-                          <div className="flex items-center gap-2 pl-4">
-                            <span className="text-gray-300">└</span>
-                            <span className="text-sm text-gray-600">{guest.full_name}</span>
-                          </div>
-                        </td>
-                        <td className="px-6 py-2.5 whitespace-nowrap">
-                          <span className="text-sm text-gray-400">{guest.email || '-'}</span>
-                        </td>
-                        <td className="px-6 py-2.5 whitespace-nowrap">
-                          <span className="text-sm text-gray-400">{guest.phone || '-'}</span>
-                        </td>
-                        <td className="px-6 py-2.5 whitespace-nowrap">
-                          <Badge className={`${TICKET_TYPE_COLORS[guest.ticket_type] || 'bg-gray-100 text-gray-600'} text-xs`}>
-                            {TICKET_TYPE_LABELS[guest.ticket_type] || guest.ticket_type}
-                          </Badge>
-                        </td>
-                        <td className="px-6 py-2.5 whitespace-nowrap">
-                          {guest.is_included ? (
-                            <Badge className="bg-teal-50 text-teal-700 text-xs">Included</Badge>
-                          ) : (
-                            <Badge className="bg-yellow-50 text-yellow-700 text-xs">Purchased</Badge>
-                          )}
-                        </td>
-                        <td colSpan={4} />
-                      </tr>
-                    ))}
+                    {isExpanded && registration.guests!.map((guest, gIdx) => {
+                      const g = guest as any
+                      const guestAddons = [
+                        g.has_hall_of_aime && 'HOA',
+                        g.has_wmn_at_fuse && 'WMN',
+                        g.has_vetted_va && 'Vetted VA',
+                        g.has_vip_luncheon && 'VIP Luncheon',
+                      ].filter(Boolean) as string[]
+                      return (
+                        <tr key={`${registration.id}-guest-${gIdx}`} className="bg-gray-50/70">
+                          <td className="px-6 py-2.5 whitespace-nowrap">
+                            <div className="flex items-center gap-2 pl-4">
+                              <span className="text-gray-300">└</span>
+                              <span className="text-sm text-gray-600">{guest.full_name}</span>
+                            </div>
+                          </td>
+                          <td className="px-6 py-2.5 whitespace-nowrap">
+                            <span className="text-sm text-gray-400">{guest.email || '-'}</span>
+                          </td>
+                          <td className="px-6 py-2.5 whitespace-nowrap">
+                            <span className="text-sm text-gray-400">{guest.phone || '-'}</span>
+                          </td>
+                          <td className="px-6 py-2.5 whitespace-nowrap">
+                            <Badge className={`${TICKET_TYPE_COLORS[guest.ticket_type] || 'bg-gray-100 text-gray-600'} text-xs`}>
+                              {TICKET_TYPE_LABELS[guest.ticket_type] || guest.ticket_type}
+                            </Badge>
+                          </td>
+                          <td className="px-6 py-2.5 whitespace-nowrap">
+                            {guest.is_included ? (
+                              <Badge className="bg-teal-50 text-teal-700 text-xs">Included</Badge>
+                            ) : (
+                              <Badge className="bg-yellow-50 text-yellow-700 text-xs">Purchased</Badge>
+                            )}
+                          </td>
+                          <td className="px-6 py-2.5 whitespace-nowrap" colSpan={4}>
+                            {guestAddons.length > 0 ? (
+                              <div className="flex flex-wrap gap-1">
+                                {guestAddons.map((label) => (
+                                  <Badge
+                                    key={label}
+                                    className="bg-amber-50 text-amber-700 text-[10px] font-normal"
+                                  >
+                                    {label}
+                                  </Badge>
+                                ))}
+                              </div>
+                            ) : null}
+                          </td>
+                        </tr>
+                      )
+                    })}
                   </React.Fragment>
                 )
               })
@@ -938,14 +1113,35 @@ export function FuseRegistrationManager({
                   <div className="flex items-center justify-between bg-teal-50 border border-teal-200 rounded-lg p-3">
                     <div>
                       <div className="text-sm font-medium text-teal-900">{selectedMember.full_name}</div>
-                      <div className="text-xs text-teal-600">{selectedMember.email} {selectedMember.plan_tier ? `• ${selectedMember.plan_tier}` : ''}</div>
+                      <div className="text-xs text-teal-600">
+                        {selectedMember.email}
+                        {selectedMember.plan_tier ? ` • ${selectedMember.plan_tier}` : ''}
+                        {selectedMember.billing_period
+                          ? ` • ${selectedMember.billing_period.toLowerCase() === 'annual' ? 'Annual' : 'Monthly'}`
+                          : ''}
+                      </div>
                     </div>
                     <Button
                       variant="ghost"
                       size="sm"
                       onClick={() => {
                         setSelectedMember(null)
-                        setFormData({ ...formData, full_name: '', email: '', phone: '', company: '', tier: '', ticket_type: 'general_admission', purchase_type: 'purchased', has_hall_of_aime: false, guests: [] })
+                        setFormData({
+                          ...formData,
+                          full_name: '',
+                          email: '',
+                          phone: '',
+                          company: '',
+                          tier: '',
+                          ticket_type: 'general_admission',
+                          purchase_type: 'purchased',
+                          step_completed: 'claim',
+                          has_hall_of_aime: false,
+                          has_wmn_at_fuse: false,
+                          has_vetted_va: false,
+                          has_vip_luncheon: false,
+                          guests: [],
+                        })
                       }}
                       className="text-teal-600 hover:text-teal-900"
                     >
@@ -969,7 +1165,12 @@ export function FuseRegistrationManager({
                           >
                             <div className="text-sm font-medium text-gray-900">{m.full_name || m.email}</div>
                             <div className="text-xs text-gray-500">
-                              {m.email} {m.plan_tier ? `• ${m.plan_tier}` : ''} {m.company ? `• ${m.company}` : ''}
+                              {m.email}
+                              {m.plan_tier ? ` • ${m.plan_tier}` : ''}
+                              {m.billing_period
+                                ? ` • ${m.billing_period.toLowerCase() === 'annual' ? 'Annual' : 'Monthly'}`
+                                : ''}
+                              {m.company ? ` • ${m.company}` : ''}
                             </div>
                           </button>
                         ))}
@@ -1068,33 +1269,79 @@ export function FuseRegistrationManager({
                 </div>
               </div>
 
+              {/* Eligibility override — admin escape hatch for comp tickets,
+                  legacy fixes, etc. Defaults off; API enforces normally. */}
+              <div className="mt-4 flex items-start justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 p-3">
+                <div>
+                  <Label htmlFor="skip_eligibility_check" className="text-sm font-semibold text-amber-900">
+                    Override eligibility check
+                  </Label>
+                  <p className="text-xs text-amber-700 mt-0.5">
+                    Lets you mark a non-annual member as claimed (comp tickets,
+                    sponsor seats, etc.). API gating is bypassed when on.
+                  </p>
+                </div>
+                <Switch
+                  id="skip_eligibility_check"
+                  checked={formData.skip_eligibility_check}
+                  onCheckedChange={(checked) =>
+                    setFormData({ ...formData, skip_eligibility_check: checked })
+                  }
+                />
+              </div>
+
               {editingRegistration && (
-                <div className="mt-4 space-y-2">
-                  <Label htmlFor="purchase_type">Purchase Type</Label>
-                  <Select
-                    value={formData.purchase_type}
-                    onValueChange={(value) => setFormData({ ...formData, purchase_type: value })}
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select purchase type" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="claimed">Claimed (Member Benefit)</SelectItem>
-                      <SelectItem value="purchased">Purchased</SelectItem>
-                    </SelectContent>
-                  </Select>
+                <div className="mt-4 grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="purchase_type">Purchase Type</Label>
+                    <Select
+                      value={formData.purchase_type}
+                      onValueChange={(value) => setFormData({ ...formData, purchase_type: value })}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select purchase type" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="claimed">Claimed (member benefit)</SelectItem>
+                        <SelectItem value="purchased">Purchased (paid)</SelectItem>
+                        <SelectItem value="pending">Pending payment</SelectItem>
+                        {/* 'upgraded' is read-only at this point — GA Plus was
+                            retired for Fuse 2026. Historical rows still render
+                            their badge in the table. */}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="step_completed">Step Completed</Label>
+                    <Select
+                      value={formData.step_completed}
+                      onValueChange={(value) =>
+                        setFormData({ ...formData, step_completed: value as 'claim' | 'finalized' })
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select step" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="claim">Claim (reserved / awaiting payment)</SelectItem>
+                        <SelectItem value="finalized">Finalized (paid / locked)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </div>
               )}
             </div>
 
             {/* Add-ons */}
             <div className="border-t pt-4">
-              <h3 className="font-semibold text-gray-900 mb-4">Add-ons</h3>
+              <h3 className="font-semibold text-gray-900 mb-4">Add-ons (main attendee)</h3>
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <div>
-                    <Label htmlFor="has_hall_of_aime">Hall of Aime</Label>
-                    <p className="text-sm text-gray-500">Premium add-on experience</p>
+                    <Label htmlFor="has_hall_of_aime">Hall of AIME</Label>
+                    <p className="text-sm text-gray-500">
+                      Paid add-on (VIP members get this free).
+                    </p>
                   </div>
                   <Switch
                     id="has_hall_of_aime"
@@ -1107,13 +1354,41 @@ export function FuseRegistrationManager({
                 <div className="flex items-center justify-between">
                   <div>
                     <Label htmlFor="has_wmn_at_fuse">WMN at Fuse</Label>
-                    <p className="text-sm text-gray-500">Access to women-only events</p>
+                    <p className="text-sm text-gray-500">Free — women only</p>
                   </div>
                   <Switch
                     id="has_wmn_at_fuse"
                     checked={formData.has_wmn_at_fuse}
                     onCheckedChange={(checked) =>
                       setFormData({ ...formData, has_wmn_at_fuse: checked })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label htmlFor="has_vetted_va">Vetted VA Summit</Label>
+                    <p className="text-sm text-gray-500">Free for any ticket holder</p>
+                  </div>
+                  <Switch
+                    id="has_vetted_va"
+                    checked={formData.has_vetted_va}
+                    onCheckedChange={(checked) =>
+                      setFormData({ ...formData, has_vetted_va: checked })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label htmlFor="has_vip_luncheon">VIP Luncheon</Label>
+                    <p className="text-sm text-gray-500">
+                      Free; requires VIP ticket
+                    </p>
+                  </div>
+                  <Switch
+                    id="has_vip_luncheon"
+                    checked={formData.has_vip_luncheon}
+                    onCheckedChange={(checked) =>
+                      setFormData({ ...formData, has_vip_luncheon: checked })
                     }
                   />
                 </div>
@@ -1133,59 +1408,121 @@ export function FuseRegistrationManager({
                 <p className="text-sm text-gray-500">No guests added</p>
               ) : (
                 <div className="space-y-4">
-                  {formData.guests.map((guest, index) => (
-                    <div key={index} className="border rounded-lg p-4 space-y-3">
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium text-sm">Guest {index + 1}</span>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => removeGuest(index)}
-                          className="text-red-600 hover:text-red-900"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </Button>
-                      </div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <Input
-                          placeholder="Guest Name *"
-                          value={guest.full_name}
-                          onChange={(e) => updateGuest(index, 'full_name', e.target.value)}
-                        />
-                        <Input
-                          placeholder="Guest Email"
-                          type="email"
-                          value={guest.email}
-                          onChange={(e) => updateGuest(index, 'email', e.target.value)}
-                        />
-                      </div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <Select
-                          value={guest.ticket_type}
-                          onValueChange={(value) => updateGuest(index, 'ticket_type', value)}
-                        >
-                          <SelectTrigger>
-                            <SelectValue placeholder="Ticket Type" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="vip_guest">VIP Guest (Included)</SelectItem>
-                            <SelectItem value="general_admission">General Admission</SelectItem>
-                                  <SelectItem value="vip">VIP</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <div className="flex items-center gap-2">
-                          <Switch
-                            checked={guest.is_included}
-                            onCheckedChange={(checked) =>
-                              updateGuest(index, 'is_included', checked)
-                            }
+                  {formData.guests.map((guest, index) => {
+                    const guestAddonGates: Array<{
+                      key: 'has_hall_of_aime' | 'has_wmn_at_fuse' | 'has_vetted_va' | 'has_vip_luncheon'
+                      label: string
+                      enabled: boolean
+                    }> = [
+                      {
+                        key: 'has_hall_of_aime',
+                        label: 'Hall of AIME',
+                        enabled: formData.has_hall_of_aime,
+                      },
+                      {
+                        key: 'has_wmn_at_fuse',
+                        label: 'WMN at Fuse',
+                        enabled: formData.has_wmn_at_fuse,
+                      },
+                      {
+                        key: 'has_vetted_va',
+                        label: 'Vetted VA',
+                        enabled: formData.has_vetted_va,
+                      },
+                      {
+                        key: 'has_vip_luncheon',
+                        label: 'VIP Luncheon',
+                        enabled: formData.has_vip_luncheon,
+                      },
+                    ]
+                    return (
+                      <div key={index} className="border rounded-lg p-4 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium text-sm">Guest {index + 1}</span>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => removeGuest(index)}
+                            className="text-red-600 hover:text-red-900"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <Input
+                            placeholder="Guest Name *"
+                            value={guest.full_name}
+                            onChange={(e) => updateGuest(index, 'full_name', e.target.value)}
                           />
-                          <Label className="text-sm">Included with VIP</Label>
+                          <Input
+                            placeholder="Guest Email"
+                            type="email"
+                            value={guest.email}
+                            onChange={(e) => updateGuest(index, 'email', e.target.value)}
+                          />
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <Select
+                            value={guest.ticket_type}
+                            onValueChange={(value) => updateGuest(index, 'ticket_type', value)}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="Ticket Type" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="vip_guest">VIP Guest (Included)</SelectItem>
+                              <SelectItem value="general_admission">General Admission</SelectItem>
+                              <SelectItem value="vip">VIP</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          <div className="flex items-center gap-2">
+                            <Switch
+                              checked={guest.is_included}
+                              onCheckedChange={(checked) =>
+                                updateGuest(index, 'is_included', checked)
+                              }
+                            />
+                            <Label className="text-sm">Included with VIP</Label>
+                          </div>
+                        </div>
+                        {/* Per-guest add-ons — disabled when the main
+                            attendee doesn't carry the flag, since the
+                            server-side gate would strip the value anyway. */}
+                        <div>
+                          <p className="text-xs uppercase tracking-wide text-gray-500 mb-1.5">
+                            Add-ons
+                          </p>
+                          <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-gray-700">
+                            {guestAddonGates.map((gate) => (
+                              <label
+                                key={gate.key}
+                                className={`inline-flex items-center gap-1.5 ${
+                                  gate.enabled ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'
+                                }`}
+                                title={
+                                  gate.enabled
+                                    ? ''
+                                    : `Enable ${gate.label} on the main attendee first.`
+                                }
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="h-3.5 w-3.5"
+                                  checked={gate.enabled && (guest as any)[gate.key]}
+                                  disabled={!gate.enabled}
+                                  onChange={() =>
+                                    gate.enabled && updateGuest(index, gate.key, !(guest as any)[gate.key])
+                                  }
+                                />
+                                {gate.label}
+                              </label>
+                            ))}
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>

@@ -72,8 +72,10 @@ export async function POST(request: NextRequest) {
       || request.headers.get('x-real-ip')
       || 'unknown'
 
-    // Rate limit check
-    if (isRateLimited(ip)) {
+    // Rate limit check. Skipped in dev so repeated test sign-ups don't
+    // get throttled. Prod (NODE_ENV='production') enforces normally.
+    const isDev = process.env.NODE_ENV !== 'production'
+    if (!isDev && isRateLimited(ip)) {
       return NextResponse.json(
         { success: false, error: 'Too many signup attempts. Please try again later.' },
         { status: 429 }

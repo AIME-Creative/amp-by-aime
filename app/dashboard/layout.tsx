@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation'
 import DashboardLayout from '@/components/layout/DashboardLayout'
 import { getViewAsSettings, applyViewAsOverride } from '@/lib/view-as-server'
 import { getImpersonationSettings } from '@/lib/impersonation-server'
+import { canSeeFuse } from '@/lib/fuse/visibility'
 
 export default async function Layout({
   children,
@@ -50,7 +51,7 @@ export default async function Layout({
   // Fetch active Fuse event for banner display
   const { data: activeFuseEvent } = await supabase
     .from('fuse_events')
-    .select('name, year, location, registration_open')
+    .select('name, year, location, registration_open, end_date')
     .eq('is_active', true)
     .single()
 
@@ -81,10 +82,13 @@ export default async function Layout({
       paymentFailedAt={profile?.payment_failed_at}
       subscriptionStatus={profile?.stripe_subscription_status}
       planTier={effectiveProfile?.plan_tier}
+      billingPeriod={effectiveProfile?.billing_period}
       fuseTicketClaimedYear={profile?.fuse_ticket_claimed_year}
       fuseActiveEventYear={activeFuseEvent?.year}
+      fuseActiveEventEndDate={activeFuseEvent?.end_date}
       fuseEventName={activeFuseEvent?.name}
       fuseEventLocation={activeFuseEvent?.location}
+      fuseVisible={canSeeFuse(isAdmin)}
       isAdminPreview={isAdminPreview}
     >
       {children}

@@ -81,9 +81,37 @@ export default function CompleteProfilePage() {
           return
         }
 
-        // Check if they skipped plan selection
+        // Legacy 'select_plan' state. Pre-consolidation onboarding
+        // had plan picking as its own route; the new sign-up pays
+        // inline. Two cases now end up here:
+        //   1) Already paid (active/trialing sub) but the sign-up's
+        //      onboarding_step UPDATE never fired — they're on the
+        //      right step, just mis-labeled. Fall through to
+        //      complete-profile, no redirect needed.
+        //   2) Never paid — route them to /dashboard/select-plan to
+        //      complete checkout.
         if (profile.onboarding_step === 'select_plan') {
-          router.push('/onboarding/select-plan')
+          // Check both columns — they're written by different code paths
+          // and aren't always in sync. Active in either counts.
+          const status = profile.stripe_subscription_status ?? profile.subscription_status
+          const hasActiveSub = status === 'active' || status === 'trialing'
+          if (!hasActiveSub) {
+            router.push('/dashboard/select-plan')
+            return
+          }
+          // Paid but mis-labeled — silently clear the stale state and
+          // continue on to complete-profile.
+          await supabase
+            .from('profiles')
+            .update({ onboarding_step: 'complete_profile' })
+            .eq('id', user.id)
+        }
+
+        // Fuse 2026 wedge: between checkout and complete-profile we offer
+        // eligible annual members a one-tap claim. The page self-skips
+        // when the user isn't eligible or the event has ended.
+        if (profile.onboarding_step === 'claim_fuse_ticket') {
+          router.push('/onboarding/claim-fuse-ticket')
           return
         }
 

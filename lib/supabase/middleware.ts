@@ -74,10 +74,14 @@ export async function updateSession(request: NextRequest) {
         profile.plan_tier !== 'None' &&
         profile.plan_tier !== 'Pending Checkout'
 
-      // If no active subscription or no paid plan, force back to plan selection
+      // If no active subscription or no paid plan, force back to the
+      // in-app plan picker. The old /onboarding/select-plan route was
+      // deprecated when sign-up consolidated into a one-page checkout;
+      // anyone landing on it (or here) goes through the dashboard
+      // picker instead.
       if (!hasActiveSubscription || !hasPaidPlan) {
-        if (!request.nextUrl.pathname.startsWith('/onboarding/select-plan')) {
-          return NextResponse.redirect(new URL('/onboarding/select-plan', request.url))
+        if (!request.nextUrl.pathname.startsWith('/dashboard/select-plan')) {
+          return NextResponse.redirect(new URL('/dashboard/select-plan', request.url))
         }
       }
       // If they have subscription but haven't completed profile
@@ -126,9 +130,9 @@ export async function updateSession(request: NextRequest) {
       profile?.plan_tier !== 'None' &&
       profile?.plan_tier !== 'Pending Checkout'
 
-    // No subscription or Pending Checkout = go to plan selection
+    // No subscription or Pending Checkout = go to in-app plan picker
     if (!hasActiveSubscription || !hasPaidPlan) {
-      return NextResponse.redirect(new URL('/onboarding/select-plan', request.url))
+      return NextResponse.redirect(new URL('/dashboard/select-plan', request.url))
     }
 
     // Has subscription but profile not complete = go to complete profile

@@ -64,9 +64,30 @@ const FUSE_COUNT_OPTIONS = [
 // ===== Component =====
 
 export function FuseCheckout({ event, prices, isEarlyBird }: FuseCheckoutProps) {
-  // Derive tickets and addons from prices
-  const tickets = useMemo(() => prices.filter((p) => !p.is_addon), [prices])
-  const addons = useMemo(() => prices.filter((p) => p.is_addon), [prices])
+  // Derive tickets and addons from prices.
+  // Defensive dedup by product_key: parent should already pass deduped
+  // phase-active rows via pickActivePrices(), but if a row pair sneaks
+  // through we still render only one card per product.
+  const tickets = useMemo(() => {
+    const seen = new Set<string>()
+    return prices
+      .filter((p) => !p.is_addon)
+      .filter((p) => {
+        if (seen.has(p.product_key)) return false
+        seen.add(p.product_key)
+        return true
+      })
+  }, [prices])
+  const addons = useMemo(() => {
+    const seen = new Set<string>()
+    return prices
+      .filter((p) => p.is_addon)
+      .filter((p) => {
+        if (seen.has(p.product_key)) return false
+        seen.add(p.product_key)
+        return true
+      })
+  }, [prices])
 
   // Step state
   const [step, setStep] = useState<Step>(1)

@@ -206,7 +206,7 @@ const standardFeatureMatrix: Record<string, Record<string, string>> = {
     'premium-guest': '✗',
     premium: '1 GA Ticket',
     elite: '1 GA Ticket',
-    vip: '1 VIP Ticket & 1 VIP Guest',
+    vip: '2 VIP Tickets + 2 Hall of AIME Tickets',
   },
   'Discount on AIME products/services/tickets': {
     'premium-guest': '✗',
@@ -318,7 +318,7 @@ const processorFeatureMatrix: Record<string, Record<string, string>> = {
     'premium-guest': '—',
     premium: '1 GA Ticket',
     elite: '1 GA Ticket',
-    vip: '1 VIP Ticket & 1 VIP Guest',
+    vip: '2 VIP Tickets + 2 Hall of AIME Tickets',
   },
   'Discount on AIME products/services/tickets': {
     'premium-guest': '—',
