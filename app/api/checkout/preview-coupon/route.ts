@@ -4,12 +4,11 @@ import { stripe } from '@/lib/stripe/config'
 
 export async function POST(request: NextRequest) {
   try {
+    // No auth gate: this route is called from /sign-up before the user
+    // exists in Supabase. It only validates a Stripe promotion code +
+    // looks up the public plan price — no PII or per-user data leaks,
+    // and Stripe itself rate-limits abuse.
     const supabase = await createClient()
-    const { data: { user } } = await supabase.auth.getUser()
-
-    if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
 
     const { code, planId, billingInterval } = await request.json()
     if (!code || !planId || !billingInterval) {
