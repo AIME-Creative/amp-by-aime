@@ -14,6 +14,17 @@
 
 import { ghlClient } from '@/lib/ghl/client'
 
+/**
+ * Drop event type. The receiver routes off this so AIME can have
+ * separate GHL workflows for first-time registrations vs subsequent
+ * top-up edits.
+ *   - 'new'    : first webhook for this registration (claim, monthly buy
+ *                finalize, claim+finalize one-shot, inbound GHL form)
+ *   - 'update' : subsequent webhook for the same registration (top-up,
+ *                annual claimer adding addons after the initial claim)
+ */
+export type FuseDropEventType = 'new' | 'update'
+
 export interface FuseRegistrationForGhl {
   // Identifiers
   registration_id: string
@@ -66,8 +77,16 @@ export interface FuseRegistrationForGhl {
   created_at: string
 }
 
-export function buildOpportunityPayload(reg: FuseRegistrationForGhl) {
+export function buildOpportunityPayload(
+  reg: FuseRegistrationForGhl,
+  eventType: FuseDropEventType = 'new',
+) {
   return {
+    // Routing flag — `'new'` for the first push, `'update'` for any
+    // subsequent push for the same registration. AIME can also branch
+    // on this in the receiver workflow.
+    event_type: eventType,
+
     // Identifiers
     registration_id: reg.registration_id,
     fuse_event_id: reg.fuse_event_id,
@@ -121,12 +140,23 @@ export function buildOpportunityPayload(reg: FuseRegistrationForGhl) {
 
 /**
  * POST the Fuse registration payload to the AIME-owned Opportunity
- * webhook. Returns silently — caller does not need to await or handle
- * errors.
+ * webhook. The destination URL depends on `eventType`:
+ *   - 'new'    → GHL_FUSE_OPPORTUNITY_WEBHOOK_URL_NEW
+ *   - 'update' → GHL_FUSE_OPPORTUNITY_WEBHOOK_URL_UPDATE
+ *
+ * Either can fall back to GHL_FUSE_OPPORTUNITY_WEBHOOK_URL if the
+ * specific var isn't set, so single-URL deploys still work. Returns
+ * silently — caller does not need to await or handle errors.
  */
-export async function dropFuseRegistration(reg: FuseRegistrationForGhl): Promise<void> {
+export async function dropFuseRegistration(
+  reg: FuseRegistrationForGhl,
+  eventType: FuseDropEventType = 'new',
+): Promise<void> {
   try {
-    await ghlClient.postFuseOpportunity(buildOpportunityPayload(reg))
+    await ghlClient.postFuseOpportunity(
+      buildOpportunityPayload(reg, eventType),
+      eventType,
+    )
   } catch (err) {
     console.error('Fuse opportunity webhook failed:', err)
   }

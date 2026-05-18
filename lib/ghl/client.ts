@@ -381,15 +381,29 @@ class GHLClient {
 
   /**
    * POST a Fuse registration → Opportunity payload to an AIME-owned
-   * webhook URL (env: GHL_FUSE_OPPORTUNITY_WEBHOOK_URL). The webhook
-   * receiver is responsible for creating / updating the GHL Opportunity
-   * and mapping fields to the right pipeline / stage. Our job is just to
-   * send a stable payload shape.
+   * webhook URL. The destination depends on whether this is the first
+   * push for the registration ('new') or a subsequent edit ('update'):
+   *
+   *   - 'new'    → GHL_FUSE_OPPORTUNITY_WEBHOOK_URL_NEW
+   *   - 'update' → GHL_FUSE_OPPORTUNITY_WEBHOOK_URL_UPDATE
+   *
+   * Both fall back to GHL_FUSE_OPPORTUNITY_WEBHOOK_URL if the specific
+   * var isn't set, so single-URL deploys still work without changes.
    */
-  async postFuseOpportunity(payload: Record<string, unknown>): Promise<boolean> {
-    const url = process.env.GHL_FUSE_OPPORTUNITY_WEBHOOK_URL
+  async postFuseOpportunity(
+    payload: Record<string, unknown>,
+    eventType: 'new' | 'update' = 'new',
+  ): Promise<boolean> {
+    const specific =
+      eventType === 'update'
+        ? process.env.GHL_FUSE_OPPORTUNITY_WEBHOOK_URL_UPDATE
+        : process.env.GHL_FUSE_OPPORTUNITY_WEBHOOK_URL_NEW
+    const fallback = process.env.GHL_FUSE_OPPORTUNITY_WEBHOOK_URL
+    const url = specific || fallback
     if (!url) {
-      console.warn('GHL_FUSE_OPPORTUNITY_WEBHOOK_URL not configured; skipping opportunity push')
+      console.warn(
+        `GHL_FUSE_OPPORTUNITY_WEBHOOK_URL${eventType === 'update' ? '_UPDATE' : '_NEW'} (and fallback) not configured; skipping opportunity push`,
+      )
       return false
     }
     try {
@@ -400,12 +414,16 @@ class GHLClient {
       })
       if (!response.ok) {
         const error = await response.text()
-        console.error('Error posting Fuse opportunity webhook:', response.status, error)
+        console.error(
+          `Error posting Fuse opportunity webhook (${eventType}):`,
+          response.status,
+          error,
+        )
         return false
       }
       return true
     } catch (error) {
-      console.error('Error posting Fuse opportunity webhook:', error)
+      console.error(`Error posting Fuse opportunity webhook (${eventType}):`, error)
       return false
     }
   }

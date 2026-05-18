@@ -536,7 +536,7 @@ export async function POST(request: NextRequest) {
           total_paid_cents: totalCents,
           invoice_number: paymentIntentForResponse?.id ?? null,
           created_at: registration.created_at ?? new Date().toISOString(),
-        })
+        }, 'new')
       } catch (dropErr) {
         console.error('Fuse GHL drop failed (non-fatal):', dropErr)
       }

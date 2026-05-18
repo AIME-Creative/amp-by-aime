@@ -392,6 +392,13 @@ export async function POST(
 
     // Fire Fuse Opportunity webhook push. Only when DB writes succeeded
     // so AIME doesn't receive state that didn't persist on our side.
+    //
+    // Annual claimers already received a 'new' drop from the claim
+    // route — this finalize call is an UPDATE for them. Monthly buyers
+    // skipped the claim drop (auto-reservation), so this is their
+    // first push and rates as NEW.
+    const finalizeDropEvent =
+      registration.purchase_type === 'claimed' ? 'update' : 'new'
     if (shouldDropFuseRegistration(isAdmin) && !writeFailed) {
       try {
         await dropFuseRegistration({
@@ -426,7 +433,7 @@ export async function POST(
           total_paid_cents: totalCents,
           invoice_number: paymentIntentForResponse?.id ?? null,
           created_at: new Date().toISOString(),
-        })
+        }, finalizeDropEvent)
       } catch (dropErr) {
         console.error('Fuse GHL drop failed (non-fatal):', dropErr)
       }
