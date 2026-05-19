@@ -72,6 +72,7 @@ interface FuseClaimPageProps {
     company?: string
     plan_tier?: string
     billing_period?: string
+    subscription_override?: boolean | null
     gender?: string
   }
   existingRegistration: {
@@ -197,6 +198,7 @@ export function FuseClaimPage({
   const fuseEligibility = getFuseEligibility(
     userProfile.plan_tier,
     userProfile.billing_period,
+    userProfile.subscription_override,
   )
   const tierInclusion =
     fuseEligibility.kind === 'claim'
@@ -688,7 +690,11 @@ function Step2Panel({
           .filter((g) => g.firstName.trim().length > 0)
           .map((g) => ({
             full_name: `${g.firstName.trim()} ${g.lastName.trim()}`.trim(),
-            ticket_type: 'general_admission',
+            // VIP plan members get one free VIP guest slot (2 VIP tickets
+            // total per VIP membership). Server pricing engine in
+            // lib/fuse/pricing.ts allocates the included slot via
+            // vipIncludedRemaining; any excess guests pay as GA.
+            ticket_type: tier === 'VIP' ? 'vip' : 'general_admission',
             is_included: false,
             addons: {
               has_hall_of_aime: g.addons.hoa && mainHasHoaEffective,
@@ -1278,7 +1284,11 @@ function ManagePanel({
           .filter((g) => g.firstName.trim().length > 0)
           .map((g) => ({
             full_name: `${g.firstName.trim()} ${g.lastName.trim()}`.trim(),
-            ticket_type: 'general_admission',
+            // VIP plan members get one free VIP guest slot (2 VIP tickets
+            // total per VIP membership). Server pricing engine in
+            // lib/fuse/pricing.ts allocates the included slot via
+            // vipIncludedRemaining; any excess guests pay as GA.
+            ticket_type: tier === 'VIP' ? 'vip' : 'general_admission',
             is_included: false,
             addons: {
               has_hall_of_aime: g.addons.hoa && mainHasHoaEffective,

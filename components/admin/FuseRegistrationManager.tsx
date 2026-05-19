@@ -284,6 +284,7 @@ export function FuseRegistrationManager({
     const eligibility = getFuseEligibility(
       member.plan_tier,
       member.billing_period,
+      member.subscription_override,
     )
 
     const tier = eligibility.kind === 'claim'

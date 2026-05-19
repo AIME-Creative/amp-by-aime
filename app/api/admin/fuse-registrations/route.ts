@@ -252,19 +252,24 @@ export async function POST(request: Request) {
     // look up by email. Pull billing_period too — it's needed for
     // eligibility gating below.
     let memberProfile:
-      | { id: string; plan_tier: string | null; billing_period: string | null }
+      | {
+          id: string
+          plan_tier: string | null
+          billing_period: string | null
+          subscription_override: boolean | null
+        }
       | null = null
     if (body.user_id) {
       const { data: mp } = await supabase
         .from('profiles')
-        .select('id, plan_tier, billing_period')
+        .select('id, plan_tier, billing_period, subscription_override')
         .eq('id', body.user_id)
         .single()
       memberProfile = mp
     } else {
       const { data: mp } = await supabase
         .from('profiles')
-        .select('id, plan_tier, billing_period')
+        .select('id, plan_tier, billing_period, subscription_override')
         .eq('email', email.toLowerCase())
         .single()
       memberProfile = mp
@@ -282,6 +287,7 @@ export async function POST(request: Request) {
       const eligibility = getFuseEligibility(
         memberProfile.plan_tier,
         memberProfile.billing_period,
+        memberProfile.subscription_override,
       )
       if (purchase_type === 'claimed' && eligibility.kind !== 'claim') {
         return NextResponse.json(

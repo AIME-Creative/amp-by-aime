@@ -31,7 +31,7 @@ export async function GET(request: NextRequest) {
   // monthly Premium/Elite/VIP → purchased/pending).
   const { data: members } = await supabase
     .from('profiles')
-    .select('id, full_name, email, phone, company, plan_tier, billing_period, fuse_ticket_claimed_year')
+    .select('id, full_name, email, phone, company, plan_tier, billing_period, subscription_override, fuse_ticket_claimed_year')
     .or(`full_name.ilike.${searchTerm},email.ilike.${searchTerm},company.ilike.${searchTerm}`)
     .order('full_name')
     .limit(10)

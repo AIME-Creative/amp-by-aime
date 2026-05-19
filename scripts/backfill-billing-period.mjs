@@ -59,6 +59,7 @@ async function main() {
 
   const updates = []
   const skips = []
+  let processed = 0
 
   for (const row of rows) {
     await sleep(RATE_LIMIT_MS)
@@ -70,6 +71,8 @@ async function main() {
       })
     } catch (err) {
       skips.push({ id: row.id, email: row.email, reason: `stripe_error:${err.code || err.message}` })
+      processed++
+      if (processed % 25 === 0) console.log(`  ...processed ${processed}/${rows.length}`)
       continue
     }
 
@@ -91,6 +94,9 @@ async function main() {
       payment_amount: paymentAmount,
       sub_id: row.stripe_subscription_id,
     })
+
+    processed++
+    if (processed % 25 === 0) console.log(`  ...processed ${processed}/${rows.length}`)
   }
 
   console.log(`Planned updates: ${updates.length}`)

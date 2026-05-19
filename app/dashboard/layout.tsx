@@ -83,6 +83,7 @@ export default async function Layout({
       subscriptionStatus={profile?.stripe_subscription_status}
       planTier={effectiveProfile?.plan_tier}
       billingPeriod={effectiveProfile?.billing_period}
+      subscriptionOverride={effectiveProfile?.subscription_override}
       fuseTicketClaimedYear={profile?.fuse_ticket_claimed_year}
       fuseActiveEventYear={activeFuseEvent?.year}
       fuseActiveEventEndDate={activeFuseEvent?.end_date}

@@ -29,7 +29,7 @@ export default async function FuseRegistrationPage() {
   // Get user profile
   const { data: profile } = await supabase
     .from('profiles')
-    .select('id, email, full_name, phone, company, plan_tier, billing_period, fuse_ticket_claimed_year, gender, is_admin')
+    .select('id, email, full_name, phone, company, plan_tier, billing_period, subscription_override, fuse_ticket_claimed_year, gender, is_admin')
     .eq('id', effectiveUserId)
     .single()
 
@@ -61,7 +61,7 @@ export default async function FuseRegistrationPage() {
   // Eligibility: annual eligible tier (claim flow) OR monthly eligible
   // tier (buy flow). Anyone else bounces to /dashboard. Admins bypass
   // so they can preview either variant regardless of their own plan.
-  const eligibility = getFuseEligibility(profile.plan_tier, profile.billing_period)
+  const eligibility = getFuseEligibility(profile.plan_tier, profile.billing_period, profile.subscription_override)
   if (!isAdmin && eligibility.kind === 'none') {
     redirect('/dashboard')
   }
@@ -152,6 +152,7 @@ export default async function FuseRegistrationPage() {
         company: profile.company,
         plan_tier: profile.plan_tier,
         billing_period: profile.billing_period,
+        subscription_override: profile.subscription_override,
         gender: profile.gender,
       }}
       existingRegistration={existingRegistration}
