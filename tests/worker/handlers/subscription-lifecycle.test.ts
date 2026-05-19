@@ -190,6 +190,109 @@ describe('subscription-lifecycle handler', () => {
     expect(mocks.markProcessedMock).toHaveBeenCalled();
   });
 
+  it('cancel_at_period_end: reads current_period_end from items[0] (modern API shape) and sets pending_plan_tier', async () => {
+    const db = makeMockDb();
+    mocks.getSupabaseAdminMock.mockReturnValue(db.client);
+
+    db.setReads('profiles', [
+      {
+        id: 'p4',
+        email: 'cancel@example.com',
+        full_name: 'Cancel User',
+        plan_tier: 'Premium',
+        stripe_subscription_id: 'sub_c1',
+        subscription_override: false,
+        pending_plan_tier: null,
+        pending_plan_price_id: null,
+        payment_failed_at: null,
+      },
+      null,
+    ]);
+    db.setRead('subscription_plans', { plan_tier: 'Premium' });
+
+    const stripeEvent = {
+      type: 'customer.subscription.updated',
+      data: { object: { id: 'sub_c1', customer: 'cus_c1' } },
+    };
+    mocks.getEventByIdMock.mockResolvedValue(
+      syncEventRow({ event_type: stripeEvent.type, payload: stripeEvent }),
+    );
+    // Modern Stripe API shape: current_period_end on items[0], NOT on subscription root.
+    const periodEnd = 1779313162; // arbitrary timestamp
+    mocks.subscriptionsRetrieve.mockResolvedValue({
+      id: 'sub_c1',
+      customer: 'cus_c1',
+      status: 'active',
+      cancel_at_period_end: true,
+      items: {
+        data: [
+          {
+            current_period_end: periodEnd,
+            price: { id: 'price_premium', recurring: { interval: 'month' }, unit_amount: 1999 },
+          },
+        ],
+      },
+      metadata: {},
+    });
+
+    await handleSubscriptionLifecycle([
+      { id: 'jobC', data: { sync_event_id: 'sync-evt-C' } } as never,
+    ]);
+
+    const profileUpdate = db.updates.find((u) => u.table === 'profiles');
+    expect(profileUpdate).toBeDefined();
+    expect(profileUpdate!.updates).toMatchObject({
+      pending_plan_tier: 'Canceled',
+      pending_plan_effective_date: new Date(periodEnd * 1000).toISOString(),
+      pending_plan_price_id: null,
+    });
+  });
+
+  it('cancel_at_period_end: errors out cleanly when current_period_end is missing everywhere', async () => {
+    const db = makeMockDb();
+    mocks.getSupabaseAdminMock.mockReturnValue(db.client);
+
+    db.setReads('profiles', [
+      {
+        id: 'p5',
+        email: 'broken@example.com',
+        full_name: 'Broken Stripe Response',
+        plan_tier: 'Premium',
+        stripe_subscription_id: 'sub_d1',
+        subscription_override: false,
+        pending_plan_tier: null,
+        pending_plan_price_id: null,
+        payment_failed_at: null,
+      },
+      null,
+    ]);
+    db.setRead('subscription_plans', { plan_tier: 'Premium' });
+
+    const stripeEvent = {
+      type: 'customer.subscription.updated',
+      data: { object: { id: 'sub_d1', customer: 'cus_d1' } },
+    };
+    mocks.getEventByIdMock.mockResolvedValue(
+      syncEventRow({ event_type: stripeEvent.type, payload: stripeEvent }),
+    );
+    mocks.subscriptionsRetrieve.mockResolvedValue({
+      id: 'sub_d1',
+      customer: 'cus_d1',
+      status: 'active',
+      cancel_at_period_end: true,
+      // No current_period_end ANYWHERE — should throw a descriptive error.
+      items: { data: [{ price: { id: 'price_premium' } }] },
+      metadata: {},
+    });
+
+    await expect(
+      handleSubscriptionLifecycle([
+        { id: 'jobD', data: { sync_event_id: 'sync-evt-D' } } as never,
+      ]),
+    ).rejects.toThrow(/no current_period_end found/);
+    expect(mocks.markFailedMock).toHaveBeenCalled();
+  });
+
   it('subscription_override: only stripe_subscription_id is synced, tier left alone', async () => {
     const db = makeMockDb();
     mocks.getSupabaseAdminMock.mockReturnValue(db.client);
