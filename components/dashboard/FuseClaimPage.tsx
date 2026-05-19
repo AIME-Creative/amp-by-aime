@@ -56,12 +56,6 @@ interface AllPriceRow {
   sort_order: number
 }
 
-interface GuestPricingRule {
-  tier: string
-  base_product_key: string
-  discount_percent: number
-}
-
 interface FuseClaimPageProps {
   event: FuseEvent
   userProfile: {
@@ -94,7 +88,6 @@ interface FuseClaimPageProps {
   isAdmin: boolean
   tierPrices: TierPrice[]
   allPrices: AllPriceRow[]
-  guestPricingRules: GuestPricingRule[]
 }
 
 const TIER_INCLUSIONS: Record<string, { ticket: string; label: string }> = {
@@ -165,7 +158,6 @@ export function FuseClaimPage({
   isAdmin,
   tierPrices,
   allPrices,
-  guestPricingRules,
 }: FuseClaimPageProps) {
   const router = useRouter()
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -340,7 +332,6 @@ export function FuseClaimPage({
                 eventYear={event.year}
                 addonPrices={addonPrices}
                 allPrices={allPrices}
-                guestPricingRules={guestPricingRules}
                 gender={gender}
                 router={router}
                 inputStyle={inputStyle}
@@ -355,7 +346,6 @@ export function FuseClaimPage({
                 tier={(userProfile.plan_tier as string | undefined) ?? null}
                 addonPrices={addonPrices}
                 allPrices={allPrices}
-                guestPricingRules={guestPricingRules}
                 gender={gender}
                 router={router}
                 inputStyle={inputStyle}
@@ -483,7 +473,6 @@ interface Step2PanelProps {
   eventYear: number
   addonPrices: TierPrice[]
   allPrices: AllPriceRow[]
-  guestPricingRules: GuestPricingRule[]
   gender: string
   router: ReturnType<typeof useRouter>
   inputStyle: React.CSSProperties
@@ -502,7 +491,6 @@ function Step2Panel({
   eventYear,
   addonPrices,
   allPrices,
-  guestPricingRules,
   gender,
   router,
   inputStyle,
@@ -603,7 +591,6 @@ function Step2Panel({
 
   const guestPlan = planGuestPricing({
     tier,
-    rules: guestPricingRules,
     prices: allPrices,
     existingIncludedCount: 0,
     existingGuestHoaIncludedCount: 0,
@@ -994,7 +981,6 @@ interface ManagePanelProps {
   tier: string | null
   addonPrices: TierPrice[]
   allPrices: AllPriceRow[]
-  guestPricingRules: GuestPricingRule[]
   gender: string
   router: ReturnType<typeof useRouter>
   inputStyle: React.CSSProperties
@@ -1008,7 +994,6 @@ function ManagePanel({
   tier,
   addonPrices,
   allPrices,
-  guestPricingRules,
   gender,
   router,
   inputStyle,
@@ -1117,7 +1102,6 @@ function ManagePanel({
 
   const guestPlan = planGuestPricing({
     tier,
-    rules: guestPricingRules,
     prices: allPrices,
     existingIncludedCount,
     existingGuestHoaIncludedCount,

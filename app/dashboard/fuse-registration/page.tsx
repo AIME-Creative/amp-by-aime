@@ -126,20 +126,14 @@ export default async function FuseRegistrationPage() {
     ...activePublicAddons.filter((a) => !tierProductKeys.includes(a.product_key)),
   ]
 
-  // Full price catalog + guest pricing rules for client-side order-summary math.
-  // planGuestPricing (used in OrderSummary) needs the regular public GA row to
-  // compute the member-discount base, which isn't always in `mergedPrices`.
+  // Full price catalog for client-side order-summary math (planGuestPricing
+  // looks up the static guest_ticket row, which isn't always in `mergedPrices`).
   const { data: allPriceRows } = await supabase
     .from('fuse_ticket_prices')
     .select('*')
     .eq('fuse_event_id', activeEvent.id)
     .eq('is_active', true)
     .order('sort_order')
-
-  const { data: guestPricingRules } = await supabase
-    .from('fuse_guest_pricing_rules')
-    .select('tier, base_product_key, discount_percent')
-    .eq('fuse_event_id', activeEvent.id)
 
   return (
     <FuseClaimPage
@@ -159,7 +153,6 @@ export default async function FuseRegistrationPage() {
       isAdmin={isAdmin}
       tierPrices={mergedPrices}
       allPrices={allPriceRows ?? []}
-      guestPricingRules={guestPricingRules ?? []}
     />
   )
 }

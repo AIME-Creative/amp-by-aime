@@ -83,14 +83,6 @@ export async function POST(request: NextRequest) {
 
       if (!allPrices) return items
 
-      // Tier-based guest pricing rules (Premium 10% / Elite 20% / VIP 30%
-      // off regular GA, per spec). Needed for the member-rate guest
-      // line items below.
-      const { data: guestRules } = await supabase
-        .from('fuse_guest_pricing_rules')
-        .select('tier, base_product_key, discount_percent')
-        .eq('fuse_event_id', fullReg.fuse_event_id)
-
       const { data: eventRow } = await supabase
         .from('fuse_events')
         .select('year')
@@ -139,18 +131,17 @@ export async function POST(request: NextRequest) {
       }
 
       // ----------------------------------------------------------------
-      // Guests. Tier-discounted member rate (or public rate for non-tier
-      // rows) — shared logic with the user-facing flow via
-      // planGuestPricing. Already-included guests (VIP first-guest slot)
-      // are skipped via `existingIncludedCount`, and we feed in only
-      // the non-included guests as "new" so they get priced.
+      // Guests. Static guest_ticket price — shared logic with the
+      // user-facing flow via planGuestPricing. Already-included guests
+      // (VIP first-guest slot) are skipped via `existingIncludedCount`,
+      // and we feed in only the non-included guests as "new" so they
+      // get priced.
       // ----------------------------------------------------------------
       const guests = fullReg.guests || []
       const includedGuestCount = guests.filter((g: any) => g.is_included).length
       const paidGuestRows = guests.filter((g: any) => !g.is_included)
       const guestPlan = planGuestPricing({
         tier: fullReg.tier ?? null,
-        rules: guestRules ?? null,
         prices: allPrices,
         existingIncludedCount: includedGuestCount,
         newGuests: paidGuestRows.map((g: any) => ({

@@ -1,10 +1,9 @@
 /**
  * Admin Fuse Stripe builder — guest pricing through planGuestPricing.
  *
- * Confirms that member-linked admin registrations charge guest tickets
- * at the spec'd member rate (Premium 10% / Elite 20% / VIP 30% off
- * regular GA) via Stripe `price_data` ad-hoc lines, not the public
- * `guest` Stripe Price.
+ * Confirms that every paid guest (member or no-tier) charges the static
+ * `guest_ticket` catalog price via the pre-made Stripe Price id, and
+ * that the VIP first-guest-included entitlement is honored.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -80,6 +79,8 @@ async function callAdminCheckout(body: any) {
   return POST(req as any)
 }
 
+const GUEST_TICKET_PRICE_ID = 'price_guest_ticket_test'
+
 beforeEach(() => {
   tableReads = new Map()
   sessionCreateMock.mockClear()
@@ -89,15 +90,11 @@ afterEach(() => {
 })
 
 // =================================================================
-// Test 1 — Premium member, 1 paid guest. Guest must charge at the
-// 10%-off regular-GA member rate via price_data, NOT the public guest
-// Stripe Price.
-//
-// Regular GA = $1299. Premium rate = $1299 * 0.90 = $1169.10
-// → 116910 cents per guest.
+// Test 1 — Premium member, 1 paid guest. Guest must charge against
+// the static guest_ticket Stripe Price id, not an ad-hoc price_data.
 // =================================================================
 describe('admin Fuse Stripe builder — guest pricing', () => {
-  it('uses member-rate price_data for a Premium-linked guest (10% off regular GA)', async () => {
+  it('uses the static guest_ticket price id for a Premium-linked guest', async () => {
     tableReads.set('profiles', { is_admin: true })
     tableReads.set('fuse_registrations', {
       id: 'reg_premium',
@@ -119,22 +116,16 @@ describe('admin Fuse Stripe builder — guest pricing', () => {
       ],
     })
     tableReads.set('fuse_ticket_prices', [
-      // Regular GA — the base for the discount math.
       {
-        product_key: 'ga',
+        product_key: 'guest_ticket',
         tier: null,
         pricing_phase: 'regular',
-        price: 1299,
+        price: 350,
         phase_end_at: null,
         is_active: true,
         is_included: false,
-        stripe_price_id: 'price_ga_regular',
+        stripe_price_id: GUEST_TICKET_PRICE_ID,
       },
-    ])
-    tableReads.set('fuse_guest_pricing_rules', [
-      { tier: 'Premium', base_product_key: 'ga', discount_percent: 10 },
-      { tier: 'Elite', base_product_key: 'ga', discount_percent: 20 },
-      { tier: 'VIP', base_product_key: 'ga', discount_percent: 30 },
     ])
     tableReads.set('fuse_events', { year: 2026 })
 
@@ -146,26 +137,19 @@ describe('admin Fuse Stripe builder — guest pricing', () => {
     expect(sessionCreateMock).toHaveBeenCalledTimes(1)
 
     const line_items = (sessionCreateMock.mock.calls[0] as any)[0].line_items as any[]
-    // Exactly one guest line for this scenario (claimed VIP/GA main is free,
-    // no HOA on main, one paid guest).
-    const guestLines = line_items.filter(
-      (li) =>
-        li.price_data?.product_data?.name?.toLowerCase().includes('guest'),
-    )
-    expect(guestLines).toHaveLength(1)
-    expect(guestLines[0].price_data.unit_amount).toBe(116910) // 1299 * 0.90 * 100
-    expect(guestLines[0].quantity).toBe(1)
-    // Critical: it's NOT pointing at a pre-made `guest` Stripe Price ID.
-    expect(guestLines[0].price).toBeUndefined()
+    expect(line_items).toHaveLength(1)
+    expect(line_items[0].price).toBe(GUEST_TICKET_PRICE_ID)
+    expect(line_items[0].quantity).toBe(1)
+    // No ad-hoc tier-discounted price_data anymore.
+    expect(line_items[0].price_data).toBeUndefined()
   })
 
   // ===============================================================
   // Test 2 — VIP claim, 2 guests. First guest is the VIP-included
-  // slot (free, no line item). Second guest charged at VIP 30% off.
-  //
-  // VIP rate = $1299 * 0.70 = $909.30 → 90930 cents.
+  // slot (free, no line item). Second guest charged the static
+  // guest_ticket price.
   // ===============================================================
-  it('skips VIP first guest (included) and charges second guest at VIP 30% off', async () => {
+  it('skips VIP first guest (included) and charges second guest the static guest_ticket price', async () => {
     tableReads.set('profiles', { is_admin: true })
     tableReads.set('fuse_registrations', {
       id: 'reg_vip',
@@ -195,23 +179,18 @@ describe('admin Fuse Stripe builder — guest pricing', () => {
     })
     tableReads.set('fuse_ticket_prices', [
       {
-        product_key: 'ga',
+        product_key: 'guest_ticket',
         tier: null,
         pricing_phase: 'regular',
-        price: 1299,
+        price: 350,
         phase_end_at: null,
         is_active: true,
         is_included: false,
-        stripe_price_id: 'price_ga_regular',
+        stripe_price_id: GUEST_TICKET_PRICE_ID,
       },
       // VIP membership HOA is free — leaving HOA stripe_price_id absent
       // so the main-HOA branch is a no-op. (VIP-claim main HOA is
       // already skipped via mainHoaIsFree.)
-    ])
-    tableReads.set('fuse_guest_pricing_rules', [
-      { tier: 'Premium', base_product_key: 'ga', discount_percent: 10 },
-      { tier: 'Elite', base_product_key: 'ga', discount_percent: 20 },
-      { tier: 'VIP', base_product_key: 'ga', discount_percent: 30 },
     ])
     tableReads.set('fuse_events', { year: 2026 })
 
@@ -222,16 +201,10 @@ describe('admin Fuse Stripe builder — guest pricing', () => {
     expect(res.status).toBe(200)
 
     const line_items = (sessionCreateMock.mock.calls[0] as any)[0].line_items as any[]
-    const guestLines = line_items.filter(
-      (li) =>
-        li.price_data?.product_data?.name?.toLowerCase().includes('guest'),
-    )
-    // Exactly one paid guest line — the first guest is VIP-included.
-    expect(guestLines).toHaveLength(1)
-    expect(guestLines[0].quantity).toBe(1)
-    expect(guestLines[0].price_data.unit_amount).toBe(90930) // 1299 * 0.70 * 100
-    // The product label should reflect the VIP member rate so the
-    // receipt isn't misleading.
-    expect(guestLines[0].price_data.product_data.name).toMatch(/VIP/i)
+    // Exactly one paid guest line — first guest is VIP-included.
+    expect(line_items).toHaveLength(1)
+    expect(line_items[0].price).toBe(GUEST_TICKET_PRICE_ID)
+    expect(line_items[0].quantity).toBe(1)
+    expect(line_items[0].price_data).toBeUndefined()
   })
 })
