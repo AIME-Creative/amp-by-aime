@@ -202,10 +202,24 @@ async function processUpsert(
 
   // cancel_at_period_end → pending_plan_tier='Canceled'.
   if (subscription.cancel_at_period_end) {
-    const cancelDate = new Date(
-      (subscription as unknown as { current_period_end: number })
-        .current_period_end * 1000,
-    );
+    // current_period_end moved off the subscription root in API
+    // version 2024-09-30+ — it now lives per-item. We use the
+    // first item's value (subscriptions in AMP have exactly one item).
+    // Fall back to root-level for older API versions returned by the
+    // refetch in case Stripe ever flips a project back.
+    const item0 = subscription.items.data[0] as
+      | { current_period_end?: number }
+      | undefined;
+    const rawTs =
+      item0?.current_period_end ??
+      (subscription as unknown as { current_period_end?: number })
+        .current_period_end;
+    if (typeof rawTs !== 'number') {
+      throw new Error(
+        `subscription-lifecycle: ${subscription.id} cancel_at_period_end set but no current_period_end found on items[0] or root`,
+      );
+    }
+    const cancelDate = new Date(rawTs * 1000);
     const pendingDowngrade = subscription.metadata?.pending_downgrade_tier;
     if (!pendingDowngrade) {
       update.pending_plan_tier = 'Canceled';
