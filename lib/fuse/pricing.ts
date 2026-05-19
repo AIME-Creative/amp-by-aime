@@ -332,7 +332,11 @@ export function planGuestPricing<T extends PriceRow>(args: {
 
     if (vipIncludedRemaining > 0) {
       vipIncludedRemaining -= 1
-      pushGuestRecord(g.ticket_type || 'vip_guest', true)
+      // This branch only fires when tier === 'VIP' (see
+      // vipIncludedRemaining computation above), so the included slot is
+      // always a VIP ticket. Force 'vip' to keep stored ticket_type
+      // truthful regardless of what the client sent.
+      pushGuestRecord('vip', true)
       displayLineItems.push({
         label: `Guest: ${name}`,
         amountCents: 'included',
@@ -342,7 +346,14 @@ export function planGuestPricing<T extends PriceRow>(args: {
       continue
     }
 
-    pushGuestRecord(g.ticket_type || 'general_admission', false)
+    // Paid-guest branch: every non-included guest is charged at the GA
+    // member rate (memberPriceDollars below) regardless of the client-
+    // supplied ticket_type. The VIP plan only grants ONE free VIP guest
+    // slot — that's handled above by the vipIncludedRemaining branch. So
+    // force the stored ticket_type to 'general_admission' here even if
+    // the client sent 'vip' (which it does for VIP plan members so the
+    // first guest's record reflects the included VIP slot).
+    pushGuestRecord('general_admission', false)
 
     if (memberPriceDollars != null) {
       const tierLabel = tier ?? 'Member'
