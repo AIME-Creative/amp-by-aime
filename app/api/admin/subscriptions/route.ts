@@ -174,13 +174,17 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Plan not found' }, { status: 404 })
     }
 
-    // If skipStripe is true, just update the profile directly (for manual/free assignments)
+    // If skipStripe is true, just update the profile directly (for manual/free assignments).
+    // Write billing_period and payment_amount from the plan row so paid
+    // manual assignments don't recreate the null-billing_period hole.
     if (skipStripe || !plan.stripe_price_id) {
       const { error: updateError } = await supabase
         .from('profiles')
         .update({
           plan_tier: plan.plan_tier,
           subscription_status: 'active',
+          billing_period: plan.billing_period,
+          payment_amount: plan.price,
         })
         .eq('id', userId)
 
@@ -231,13 +235,17 @@ export async function POST(request: Request) {
       },
     })
 
-    // Update user profile with subscription details
+    // Update user profile with subscription details. Write billing_period
+    // and payment_amount from the plan row so admin-created subs land
+    // populated without waiting for the Stripe webhook to backfill.
     const { error: updateError } = await supabase
       .from('profiles')
       .update({
         plan_tier: plan.plan_tier,
         stripe_subscription_id: subscription.id,
         subscription_status: subscription.status,
+        billing_period: plan.billing_period,
+        payment_amount: plan.price,
       })
       .eq('id', userId)
 

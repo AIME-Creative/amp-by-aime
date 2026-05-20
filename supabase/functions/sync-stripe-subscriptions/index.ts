@@ -1,5 +1,6 @@
 import { createClient } from 'jsr:@supabase/supabase-js@2'
 import Stripe from 'npm:stripe@^17.4.0'
+import { resolveSubscriptionFields } from '../_shared/billing-period.ts'
 
 const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY') ?? '', {
   apiVersion: '2025-10-29.clover',
@@ -113,23 +114,28 @@ Deno.serve(async (req) => {
 
         // Look up plan tier from Stripe price - ALWAYS check this
         const priceId = activeSubscription.items.data[0]?.price?.id
-        const unitAmount = activeSubscription.items.data[0]?.price?.unit_amount
-        const stripePaymentAmount = typeof unitAmount === 'number' ? unitAmount / 100 : null // Convert cents to dollars
         let stripePlanTier: string | null = null
-        let stripeBillingPeriod: string | null = null
 
         if (priceId) {
           const { data: plan } = await supabase
             .from('subscription_plans')
-            .select('plan_tier, billing_period')
+            .select('plan_tier')
             .eq('stripe_price_id', priceId)
             .single()
 
           if (plan) {
             stripePlanTier = plan.plan_tier
-            stripeBillingPeriod = plan.billing_period === 'annual' ? 'Annual' : 'Monthly'
           }
         }
+
+        // Resolve billing_period (lowercase) + payment_amount via the
+        // shared helper. The helper falls back to price.recurring.interval
+        // when subscription_plans has no row for this price — the old
+        // inline code silently produced null in that case, which made the
+        // billingMismatch check skip the write (this was the bug behind
+        // the 351 null-billing_period users).
+        const { billingPeriod: stripeBillingPeriod, paymentAmount: stripePaymentAmount } =
+          await resolveSubscriptionFields(stripe, supabase, activeSubscription)
 
         // Guard: skip if this subscription ID already belongs to a different profile
         if (activeSubscription.id !== profile.stripe_subscription_id) {

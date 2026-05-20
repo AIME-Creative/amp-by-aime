@@ -7,6 +7,50 @@ import { getFuseEligibility } from '@/lib/fuse/eligibility'
 const VALID_PURCHASE_TYPES = ['claimed', 'purchased', 'pending', 'upgraded'] as const
 const VALID_STEP_COMPLETED = ['claim', 'finalized'] as const
 
+export type FuseRegistrationStats = {
+  total: number
+  ga: number
+  vip: number
+  guests: number
+  hallOfAime: number
+  wmnAtFuse: number
+  vettedVa: number
+  vipLuncheon: number
+}
+
+function computeStats(rows: any[]): FuseRegistrationStats {
+  const s: FuseRegistrationStats = {
+    total: 0,
+    ga: 0,
+    vip: 0,
+    guests: 0,
+    hallOfAime: 0,
+    wmnAtFuse: 0,
+    vettedVa: 0,
+    vipLuncheon: 0,
+  }
+  for (const r of rows) {
+    s.total++
+    if (r.ticket_type === 'general_admission') s.ga++
+    else if (r.ticket_type === 'vip') s.vip++
+    if (r.has_hall_of_aime) s.hallOfAime++
+    if (r.has_wmn_at_fuse) s.wmnAtFuse++
+    if (r.has_vetted_va) s.vettedVa++
+    if (r.has_vip_luncheon) s.vipLuncheon++
+    for (const g of r.guests || []) {
+      s.total++
+      s.guests++
+      if (g.ticket_type === 'general_admission') s.ga++
+      else if (g.ticket_type === 'vip' || g.ticket_type === 'vip_guest') s.vip++
+      if (g.has_hall_of_aime) s.hallOfAime++
+      if (g.has_wmn_at_fuse) s.wmnAtFuse++
+      if (g.has_vetted_va) s.vettedVa++
+      if (g.has_vip_luncheon) s.vipLuncheon++
+    }
+  }
+  return s
+}
+
 // GET - List all fuse registrations with filtering and pagination
 export async function GET(request: NextRequest) {
   try {
@@ -81,6 +125,40 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Failed to fetch registrations' }, { status: 500 })
     }
 
+    // Aggregate stats across the FULL filtered set (not just the current
+    // page). The admin summary chips need to show every ticket / add-on
+    // for the event, even when the table only shows 10 rows at a time.
+    let statsQuery = supabase
+      .from('fuse_registrations')
+      .select(`
+        ticket_type,
+        has_hall_of_aime,
+        has_wmn_at_fuse,
+        has_vetted_va,
+        has_vip_luncheon,
+        guests:fuse_registration_guests (
+          ticket_type,
+          has_hall_of_aime,
+          has_wmn_at_fuse,
+          has_vetted_va,
+          has_vip_luncheon
+        )
+      `)
+    if (eventId) statsQuery = statsQuery.eq('fuse_event_id', eventId)
+    if (search) {
+      statsQuery = statsQuery.or(
+        `full_name.ilike.%${search}%,email.ilike.%${search}%,company.ilike.%${search}%`,
+      )
+    }
+    if (ticketType && ticketType !== 'all') statsQuery = statsQuery.eq('ticket_type', ticketType)
+    if (tier && tier !== 'all') {
+      if (tier === 'public') statsQuery = statsQuery.is('tier', null)
+      else statsQuery = statsQuery.eq('tier', tier)
+    }
+    const { data: allForStats } = await statsQuery
+
+    const stats = computeStats(allForStats || [])
+
     return NextResponse.json({
       registrations,
       pagination: {
@@ -88,7 +166,8 @@ export async function GET(request: NextRequest) {
         limit,
         total: count || 0,
         totalPages: count ? Math.ceil(count / limit) : 0,
-      }
+      },
+      stats,
     })
   } catch (error: any) {
     console.error('Error in GET /api/admin/fuse-registrations:', error)
@@ -173,19 +252,24 @@ export async function POST(request: Request) {
     // look up by email. Pull billing_period too — it's needed for
     // eligibility gating below.
     let memberProfile:
-      | { id: string; plan_tier: string | null; billing_period: string | null }
+      | {
+          id: string
+          plan_tier: string | null
+          billing_period: string | null
+          subscription_override: boolean | null
+        }
       | null = null
     if (body.user_id) {
       const { data: mp } = await supabase
         .from('profiles')
-        .select('id, plan_tier, billing_period')
+        .select('id, plan_tier, billing_period, subscription_override')
         .eq('id', body.user_id)
         .single()
       memberProfile = mp
     } else {
       const { data: mp } = await supabase
         .from('profiles')
-        .select('id, plan_tier, billing_period')
+        .select('id, plan_tier, billing_period, subscription_override')
         .eq('email', email.toLowerCase())
         .single()
       memberProfile = mp
@@ -203,6 +287,7 @@ export async function POST(request: Request) {
       const eligibility = getFuseEligibility(
         memberProfile.plan_tier,
         memberProfile.billing_period,
+        memberProfile.subscription_override,
       )
       if (purchase_type === 'claimed' && eligibility.kind !== 'claim') {
         return NextResponse.json(

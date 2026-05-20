@@ -156,11 +156,6 @@ export async function POST(
       .eq('fuse_event_id', registration.fuse_event_id)
       .eq('is_active', true)
 
-    const { data: rules } = await supabase
-      .from('fuse_guest_pricing_rules')
-      .select('tier, base_product_key, discount_percent')
-      .eq('fuse_event_id', registration.fuse_event_id)
-
     const { data: eventRow } = await supabase
       .from('fuse_events')
       .select('year')
@@ -199,7 +194,6 @@ export async function POST(
 
     const guestPlan = planGuestPricing({
       tier: registration.tier ?? null,
-      rules: rules ?? null,
       prices: priceRows ?? null,
       existingIncludedCount,
       existingGuestHoaIncludedCount,

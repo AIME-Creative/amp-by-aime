@@ -72,9 +72,11 @@ export async function POST(request: NextRequest) {
       .eq('email', email)
       .single()
 
-    // Determine tier and purchase type based on membership
+    // Determine tier and purchase type based on membership. Non-members
+    // default to 'pending' — this webhook lands a form submission, not a
+    // payment, so the row is unpaid until Stripe Checkout completes.
     let tier: string | null = null
-    let purchaseType = 'purchased'
+    let purchaseType = 'pending'
 
     if (memberProfile) {
       const planTier = memberProfile.plan_tier

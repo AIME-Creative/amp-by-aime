@@ -7,6 +7,8 @@
  *   - Annual Premium / Elite      → claim (1 free GA ticket)
  *   - Monthly Premium / Elite / VIP → buy (GA only; VIP ticket is
  *     claim-only and General Admission Plus has been removed for 2026)
+ *   - Admin override active       → claim, treated as annual at the
+ *     override tier (overrides grant full member benefits)
  *   - No tier / Free Trial / non-member → nothing in the AMP app
  */
 export type FuseEligibility =
@@ -24,11 +26,14 @@ export type FuseEligibility =
 export function getFuseEligibility(
   planTier: string | null | undefined,
   billingPeriod: string | null | undefined,
+  subscriptionOverride: boolean | null | undefined = false,
 ): FuseEligibility {
   // billing_period is written in two places with different casing:
   // stripe/billing-info writes 'Annual' / 'Monthly', other paths write
   // 'annual' / 'monthly'. Normalize so both work.
-  const annual = (billingPeriod ?? '').toLowerCase() === 'annual'
+  // Admin overrides grant full member benefits — treat as annual.
+  const annual =
+    !!subscriptionOverride || (billingPeriod ?? '').toLowerCase() === 'annual'
   if (planTier === 'VIP' && annual) {
     return { kind: 'claim', planTier: 'VIP', defaultTicket: 'vip' }
   }

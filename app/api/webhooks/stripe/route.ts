@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js'
 import Stripe from 'stripe'
 import { getBasePlanEscalations } from '@/lib/escalations'
 import { parseFullName, combineNames } from '@/lib/utils/name-parser'
+import { resolveSubscriptionFields } from '@/lib/stripe/resolve-billing-period'
 
 // Lazy initialization to avoid build-time errors
 function getSupabaseAdmin() {
@@ -90,6 +91,56 @@ export async function POST(request: NextRequest) {
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object as Stripe.Checkout.Session
+
+        // Fuse one-time-payment sessions (public checkout, admin
+        // checkout, member invoice). These don't carry plan_tier and
+        // shouldn't run through the subscription path below. Flip the
+        // referenced registration to purchased + finalized.
+        const fuseSessionTypes = new Set([
+          'fuse_registration',
+          'fuse_admin_checkout',
+          'fuse_member_invoice',
+        ])
+        if (session.metadata?.type && fuseSessionTypes.has(session.metadata.type)) {
+          const registrationId = session.metadata?.registration_id
+          if (registrationId && session.payment_status === 'paid') {
+            const { data: reg } = await supabaseAdmin
+              .from('fuse_registrations')
+              .select('id, purchase_type, step_completed')
+              .eq('id', registrationId)
+              .single()
+            if (reg) {
+              const fuseUpdate: Record<string, unknown> = {
+                step_completed: 'finalized',
+                updated_at: new Date().toISOString(),
+              }
+              if (reg.purchase_type === 'pending') {
+                fuseUpdate.purchase_type = 'purchased'
+              }
+              const { error: fuseErr } = await supabaseAdmin
+                .from('fuse_registrations')
+                .update(fuseUpdate)
+                .eq('id', registrationId)
+              if (fuseErr) {
+                console.error(
+                  `[fuse reconciler] checkout.session.completed update failed for ${registrationId}:`,
+                  fuseErr,
+                )
+              } else {
+                console.log(
+                  `[fuse reconciler] checkout.session.completed reconciled ${registrationId} (type=${session.metadata.type}):`,
+                  fuseUpdate,
+                )
+              }
+            } else {
+              console.warn(
+                `[fuse reconciler] checkout.session.completed references registration ${registrationId} but row not found`,
+              )
+            }
+          }
+          break
+        }
+
         let userId = session.metadata?.supabase_user_id
         const planTier = session.metadata?.plan_tier
         const isAdminCreated = session.metadata?.admin_created === 'true'
@@ -275,6 +326,15 @@ export async function POST(request: NextRequest) {
           // Get escalations for the new plan tier
           const newEscalations = getBasePlanEscalations(planTier)
 
+          // Resolve billing_period + payment_amount from Stripe so the
+          // profile lands with both populated. Without this they stay
+          // null until the user opens billing-info or the 4-hour cron
+          // happens to repair them — which it often can't if the price
+          // isn't in subscription_plans.
+          const { billingPeriod, paymentAmount } = session.subscription
+            ? await resolveSubscriptionFields(supabaseAdmin, session.subscription as string)
+            : { billingPeriod: null, paymentAmount: null }
+
           // Update user's plan in database with escalations
           await supabaseAdmin
             .from('profiles')
@@ -284,6 +344,8 @@ export async function POST(request: NextRequest) {
               stripe_subscription_id: session.subscription as string,
               subscription_status: 'active',
               stripe_subscription_status: 'active',
+              billing_period: billingPeriod,
+              payment_amount: paymentAmount,
               escalations_remaining: newEscalations,
               escalations_last_reset_date: new Date().toISOString(),
               updated_at: new Date().toISOString(),
@@ -346,10 +408,19 @@ export async function POST(request: NextRequest) {
             }
           }
 
+          // Resolve billing_period + payment_amount so renewals,
+          // upgrades, and downgrades all reconcile these fields.
+          const { billingPeriod, paymentAmount } = await resolveSubscriptionFields(
+            supabaseAdmin,
+            subscription,
+          )
+
           // Check if this is a scheduled downgrade taking effect
           const updateData: Record<string, any> = {
             subscription_status: subscription.status,
             stripe_subscription_status: subscription.status,
+            billing_period: billingPeriod,
+            payment_amount: paymentAmount,
             updated_at: new Date().toISOString(),
           }
 
@@ -497,6 +568,10 @@ export async function POST(request: NextRequest) {
 
               // Update profile with new subscription, tier, and reset escalations
               const newEscalations = getBasePlanEscalations(targetTier)
+              const { billingPeriod, paymentAmount } = await resolveSubscriptionFields(
+                supabaseAdmin,
+                newSubscription,
+              )
               await supabaseAdmin
                 .from('profiles')
                 .update({
@@ -504,6 +579,8 @@ export async function POST(request: NextRequest) {
                   stripe_subscription_id: newSubscription.id,
                   subscription_status: newSubscription.status,
                   stripe_subscription_status: newSubscription.status,
+                  billing_period: billingPeriod,
+                  payment_amount: paymentAmount,
                   escalations_remaining: newEscalations,
                   escalations_last_reset_date: new Date().toISOString(),
                   pending_plan_tier: null,
@@ -522,6 +599,8 @@ export async function POST(request: NextRequest) {
                   stripe_subscription_id: null,
                   subscription_status: 'canceled',
                   stripe_subscription_status: 'canceled',
+                  billing_period: null,
+                  payment_amount: null,
                   pending_plan_tier: null,
                   pending_plan_effective_date: null,
                   pending_plan_price_id: null,
@@ -580,6 +659,10 @@ export async function POST(request: NextRequest) {
               }
 
               const newEscalations = getBasePlanEscalations(newPlanTier)
+              const { billingPeriod, paymentAmount } = await resolveSubscriptionFields(
+                supabaseAdmin,
+                activeSubscription,
+              )
 
               await supabaseAdmin
                 .from('profiles')
@@ -588,6 +671,8 @@ export async function POST(request: NextRequest) {
                   stripe_subscription_id: activeSubscription.id,
                   subscription_status: activeSubscription.status,
                   stripe_subscription_status: activeSubscription.status,
+                  billing_period: billingPeriod,
+                  payment_amount: paymentAmount,
                   escalations_remaining: newEscalations,
                   escalations_last_reset_date: new Date().toISOString(),
                   pending_plan_tier: null,
@@ -607,6 +692,8 @@ export async function POST(request: NextRequest) {
                   stripe_subscription_id: null,
                   subscription_status: 'canceled',
                   stripe_subscription_status: 'canceled',
+                  billing_period: null,
+                  payment_amount: null,
                   escalations_remaining: 0,
                   pending_plan_tier: null,
                   pending_plan_effective_date: null,
@@ -791,16 +878,24 @@ export async function POST(request: NextRequest) {
 
         // ----------------------------------------------------------------
         // 1. Promote step_completed='claim' → 'finalized' if a finalize /
-        //    top-up / upgrade PI succeeded. Top-ups against an already-
-        //    finalized row are a no-op (registration stays 'finalized').
+        //    top-up / upgrade / claim+finalize PI succeeded. Top-ups
+        //    against an already-finalized row are a no-op (registration
+        //    stays 'finalized').
+        //    Also flip purchase_type='pending' → 'purchased' as a safety
+        //    net — the finalize route writes this synchronously, but if
+        //    that DB write fails post-charge the webhook still reconciles.
         // ----------------------------------------------------------------
         const isFinalizingSource =
           source === 'finalize' ||
           source === 'top-up' ||
-          source === 'upgrade-to-ga-plus'
+          source === 'upgrade-to-ga-plus' ||
+          source === 'claim_finalize'
         const regUpdate: Record<string, unknown> = {}
         if (isFinalizingSource && reg.step_completed !== 'finalized') {
           regUpdate.step_completed = 'finalized'
+        }
+        if (isFinalizingSource && reg.purchase_type === 'pending') {
+          regUpdate.purchase_type = 'purchased'
         }
         // ----------------------------------------------------------------
         // 2. Upgrade reconciliation — if the upgrade PI succeeded but

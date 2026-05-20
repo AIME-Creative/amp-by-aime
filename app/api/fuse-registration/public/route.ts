@@ -124,7 +124,10 @@ export async function POST(request: NextRequest) {
         fuse_attendance,
         ticket_type,
         tier: null,
-        purchase_type: 'purchased',
+        // Row is inserted before the Stripe Checkout redirect. Mark
+        // 'pending' until the checkout.session.completed webhook
+        // reconciler flips it to 'purchased'.
+        purchase_type: 'pending',
         has_hall_of_aime,
         has_wmn_at_fuse,
         marketing_consent: false,
