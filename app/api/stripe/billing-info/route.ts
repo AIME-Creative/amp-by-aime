@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { stripe } from '@/lib/stripe/config'
+import { resolveSubscriptionFields } from '@/lib/stripe/resolve-billing-period'
 import Stripe from 'stripe'
 
 export async function GET(request: NextRequest) {
@@ -106,18 +107,16 @@ export async function GET(request: NextRequest) {
           const priceId = activeSubscription.items.data[0]?.price?.id
           let newPlanTier = profile.plan_tier
           let newEscalations = null
-          let newBillingPeriod = null
 
           if (priceId) {
             const { data: plan } = await supabase
               .from('subscription_plans')
-              .select('plan_tier, billing_period')
+              .select('plan_tier')
               .eq('stripe_price_id', priceId)
               .single()
 
             if (plan) {
               newPlanTier = plan.plan_tier
-              newBillingPeriod = plan.billing_period === 'annual' ? 'Annual' : 'Monthly'
 
               // Get escalations for the tier
               const escalationsMap: Record<string, number> = {
@@ -134,14 +133,21 @@ export async function GET(request: NextRequest) {
                 'Free': 0
               }
               newEscalations = escalationsMap[newPlanTier] ?? 0
-              console.log(`Found plan tier ${newPlanTier} (${newBillingPeriod}) for price ${priceId}`)
+              console.log(`Found plan tier ${newPlanTier} for price ${priceId}`)
             }
           }
+
+          // Resolve billing_period (lowercase) + payment_amount via the
+          // shared helper. Replaces inline Title-Case mapping.
+          const { billingPeriod: newBillingPeriod, paymentAmount: newPaymentAmount } =
+            await resolveSubscriptionFields(supabase, activeSubscription)
 
           const updateData: Record<string, any> = {
             stripe_subscription_id: activeSubscription.id,
             subscription_status: activeSubscription.status,
             stripe_subscription_status: activeSubscription.status,
+            billing_period: newBillingPeriod,
+            payment_amount: newPaymentAmount,
             updated_at: new Date().toISOString()
           }
 
@@ -151,10 +157,6 @@ export async function GET(request: NextRequest) {
             updateData.escalations_remaining = newEscalations
             updateData.escalations_last_reset_date = new Date().toISOString()
             console.log(`Updating tier from ${profile.plan_tier} to ${newPlanTier}`)
-          }
-
-          if (newBillingPeriod) {
-            updateData.billing_period = newBillingPeriod
           }
 
           await supabase

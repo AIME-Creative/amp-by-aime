@@ -21,6 +21,18 @@ export default async function FuseRegistrationPage() {
   // Fetch initial registrations for the active event
   let registrations: any[] = []
   let pagination = { page: 1, limit: 10, total: 0, totalPages: 0 }
+  // Aggregate counts across the entire active event so the summary chips
+  // show every ticket / add-on, not just the rows on the first page.
+  let initialStats = {
+    total: 0,
+    ga: 0,
+    vip: 0,
+    guests: 0,
+    hallOfAime: 0,
+    wmnAtFuse: 0,
+    vettedVa: 0,
+    vipLuncheon: 0,
+  }
 
   if (activeEventId) {
     const { data, error, count } = await supabase
@@ -46,6 +58,44 @@ export default async function FuseRegistrationPage() {
         totalPages: count ? Math.ceil(count / 10) : 0,
       }
     }
+
+    const { data: statsRows } = await supabase
+      .from('fuse_registrations')
+      .select(`
+        ticket_type,
+        has_hall_of_aime,
+        has_wmn_at_fuse,
+        has_vetted_va,
+        has_vip_luncheon,
+        guests:fuse_registration_guests (
+          ticket_type,
+          has_hall_of_aime,
+          has_wmn_at_fuse,
+          has_vetted_va,
+          has_vip_luncheon
+        )
+      `)
+      .eq('fuse_event_id', activeEventId)
+
+    for (const r of statsRows || []) {
+      initialStats.total++
+      if (r.ticket_type === 'general_admission') initialStats.ga++
+      else if (r.ticket_type === 'vip') initialStats.vip++
+      if (r.has_hall_of_aime) initialStats.hallOfAime++
+      if (r.has_wmn_at_fuse) initialStats.wmnAtFuse++
+      if (r.has_vetted_va) initialStats.vettedVa++
+      if (r.has_vip_luncheon) initialStats.vipLuncheon++
+      for (const g of (r as any).guests || []) {
+        initialStats.total++
+        initialStats.guests++
+        if (g.ticket_type === 'general_admission') initialStats.ga++
+        else if (g.ticket_type === 'vip' || g.ticket_type === 'vip_guest') initialStats.vip++
+        if (g.has_hall_of_aime) initialStats.hallOfAime++
+        if (g.has_wmn_at_fuse) initialStats.wmnAtFuse++
+        if (g.has_vetted_va) initialStats.vettedVa++
+        if (g.has_vip_luncheon) initialStats.vipLuncheon++
+      }
+    }
   }
 
   return (
@@ -61,6 +111,7 @@ export default async function FuseRegistrationPage() {
         events={events || []}
         initialRegistrations={registrations}
         initialPagination={pagination}
+        initialStats={initialStats}
       />
     </div>
   )

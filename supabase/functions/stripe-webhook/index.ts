@@ -1,5 +1,6 @@
 import { createClient } from 'jsr:@supabase/supabase-js@2'
 import Stripe from 'npm:stripe@^17.4.0'
+import { resolveSubscriptionFields } from '../_shared/billing-period.ts'
 
 const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY') ?? '', {
   apiVersion: '2025-10-29.clover',
@@ -73,21 +74,14 @@ Deno.serve(async (req) => {
           // Get escalations for the new plan tier
           const newEscalations = getBasePlanEscalations(planTier)
 
-          // Get billing period and payment amount from the subscription
-          let billingPeriod: string | null = null
-          let paymentAmount: number | null = null
-          if (session.subscription) {
-            try {
-              const subscription = await stripe.subscriptions.retrieve(session.subscription as string)
-              const interval = subscription.items.data[0]?.price?.recurring?.interval
-              billingPeriod = interval === 'year' ? 'Annual' : interval === 'month' ? 'Monthly' : null
-              const unitAmount = subscription.items.data[0]?.price?.unit_amount
-              paymentAmount = typeof unitAmount === 'number' ? unitAmount / 100 : null // Convert cents to dollars
-              console.log(`Subscription billing period: ${billingPeriod}, payment amount: ${paymentAmount}`)
-            } catch (subError) {
-              console.error('Error fetching subscription for billing period:', subError)
-            }
-          }
+          // Resolve billing_period (lowercase) + payment_amount via the
+          // shared helper. Helper handles missing-subscription_plans-row
+          // fallback to price.recurring.interval, which the old inline
+          // code already did but using Title-Case writes.
+          const { billingPeriod, paymentAmount } = session.subscription
+            ? await resolveSubscriptionFields(stripe, supabase, session.subscription as string)
+            : { billingPeriod: null, paymentAmount: null }
+          console.log(`Subscription billing period: ${billingPeriod}, payment amount: ${paymentAmount}`)
 
           // Guard: check if this subscription ID already belongs to a different profile
           if (session.subscription) {
@@ -149,11 +143,13 @@ Deno.serve(async (req) => {
 
         console.log('Subscription updated:', { customerId, status: subscriptionStatus, priceId })
 
-        // Extract billing period and payment amount from subscription
-        const interval = subscription.items.data[0]?.price?.recurring?.interval
-        const billingPeriod = interval === 'year' ? 'Annual' : interval === 'month' ? 'Monthly' : null
-        const unitAmount = subscription.items.data[0]?.price?.unit_amount
-        const paymentAmount = typeof unitAmount === 'number' ? unitAmount / 100 : null // Convert cents to dollars
+        // Resolve billing_period (lowercase) + payment_amount via the
+        // shared helper.
+        const { billingPeriod, paymentAmount } = await resolveSubscriptionFields(
+          stripe,
+          supabase,
+          subscription,
+        )
         console.log(`Subscription details: billing_period=${billingPeriod}, payment_amount=${paymentAmount}`)
 
         // CRITICAL: Only these statuses should grant access to paid tiers
@@ -446,6 +442,11 @@ Deno.serve(async (req) => {
             }
 
             const newEscalations = getBasePlanEscalations(newPlanTier)
+            const { billingPeriod, paymentAmount } = await resolveSubscriptionFields(
+              stripe,
+              supabase,
+              activeSubscription,
+            )
 
             const { error } = await supabase
               .from('profiles')
@@ -454,6 +455,8 @@ Deno.serve(async (req) => {
                 stripe_subscription_id: activeSubscription.id,
                 subscription_status: activeSubscription.status,
                 stripe_subscription_status: activeSubscription.status,
+                billing_period: billingPeriod,
+                payment_amount: paymentAmount,
                 escalations_remaining: newEscalations,
                 escalations_last_reset_date: new Date().toISOString(),
                 // Clear any pending cancellation since they have a new active subscription
@@ -482,6 +485,8 @@ Deno.serve(async (req) => {
                 stripe_subscription_id: null,
                 subscription_status: 'canceled',
                 stripe_subscription_status: 'canceled',
+                billing_period: null,
+                payment_amount: null,
                 escalations_remaining: 0,
                 updated_at: new Date().toISOString(),
               })

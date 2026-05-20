@@ -60,6 +60,17 @@ const STEP_COMPLETED_BADGE_CLASS: Record<string, string> = {
   finalized: 'bg-green-100 text-green-800',
 }
 
+interface FuseRegistrationStats {
+  total: number
+  ga: number
+  vip: number
+  guests: number
+  hallOfAime: number
+  wmnAtFuse: number
+  vettedVa: number
+  vipLuncheon: number
+}
+
 interface FuseRegistrationManagerProps {
   events: FuseEvent[]
   initialRegistrations: FuseRegistration[]
@@ -69,6 +80,18 @@ interface FuseRegistrationManagerProps {
     total: number
     totalPages: number
   }
+  initialStats?: FuseRegistrationStats
+}
+
+const EMPTY_STATS: FuseRegistrationStats = {
+  total: 0,
+  ga: 0,
+  vip: 0,
+  guests: 0,
+  hallOfAime: 0,
+  wmnAtFuse: 0,
+  vettedVa: 0,
+  vipLuncheon: 0,
 }
 
 const TICKET_TYPE_LABELS: Record<string, string> = {
@@ -93,10 +116,12 @@ export function FuseRegistrationManager({
   events,
   initialRegistrations,
   initialPagination,
+  initialStats,
 }: FuseRegistrationManagerProps) {
   const router = useRouter()
   const [registrations, setRegistrations] = useState(initialRegistrations)
   const [pagination, setPagination] = useState(initialPagination)
+  const [stats, setStats] = useState<FuseRegistrationStats>(initialStats ?? EMPTY_STATS)
   const [isLoading, setIsLoading] = useState(false)
 
   // Filters
@@ -124,46 +149,9 @@ export function FuseRegistrationManager({
     })
   }
 
-  // Compute ticket counts across all registrations + guests (for current page/filters).
-  // Per-guest add-on flags are tallied alongside main-attendee flags so
-  // each chip in the summary header reflects the full attendee count.
-  const ticketCounts = React.useMemo(() => {
-    const counts = {
-      total: 0,
-      ga: 0,
-      gaPlus: 0,
-      vip: 0,
-      guests: 0,
-      hallOfAime: 0,
-      wmnAtFuse: 0,
-      vettedVa: 0,
-      vipLuncheon: 0,
-    }
-    for (const reg of registrations) {
-      counts.total++
-      if (reg.ticket_type === 'general_admission') counts.ga++
-      else if (reg.ticket_type === 'vip') counts.vip++
-      if (reg.has_hall_of_aime) counts.hallOfAime++
-      if (reg.has_wmn_at_fuse) counts.wmnAtFuse++
-      if ((reg as any).has_vetted_va) counts.vettedVa++
-      if ((reg as any).has_vip_luncheon) counts.vipLuncheon++
-      if (reg.guests) {
-        for (const guest of reg.guests) {
-          counts.total++
-          counts.guests++
-          if (guest.ticket_type === 'general_admission') counts.ga++
-          else if (guest.ticket_type === 'vip') counts.vip++
-          else if (guest.ticket_type === 'vip_guest') counts.vip++ // VIP guest counts as VIP for check-in
-          const g = guest as any
-          if (g.has_hall_of_aime) counts.hallOfAime++
-          if (g.has_wmn_at_fuse) counts.wmnAtFuse++
-          if (g.has_vetted_va) counts.vettedVa++
-          if (g.has_vip_luncheon) counts.vipLuncheon++
-        }
-      }
-    }
-    return counts
-  }, [registrations])
+  // Ticket counts come from the server so the summary chips reflect the
+  // entire filtered event, not just the rows on the current page.
+  const ticketCounts = stats
 
   // CSV Export — flat check-in list: one row per person.
   // Per-guest add-on columns mirror the main attendee columns so check-in
@@ -296,6 +284,7 @@ export function FuseRegistrationManager({
     const eligibility = getFuseEligibility(
       member.plan_tier,
       member.billing_period,
+      member.subscription_override,
     )
 
     const tier = eligibility.kind === 'claim'
@@ -410,6 +399,7 @@ export function FuseRegistrationManager({
       if (response.ok) {
         setRegistrations(data.registrations)
         setPagination(data.pagination)
+        if (data.stats) setStats(data.stats)
       } else {
         toast.error(data.error || 'Failed to fetch registrations')
       }
@@ -794,8 +784,11 @@ export function FuseRegistrationManager({
         </div>
       </div>
 
-      {/* Ticket Count Summary */}
-      {registrations.length > 0 && (
+      {/* Ticket Count Summary — totals come from the API stats payload
+          so chips reflect the entire event, not just the current page.
+          All add-on chips render even when the count is 0 so admins can
+          see every category at a glance. */}
+      {ticketCounts.total > 0 && (
         <div className="px-6 py-3 border-b border-gray-200 bg-gray-50/50">
           <div className="flex flex-wrap items-center gap-3 text-sm">
             <span className="font-medium text-gray-700">
@@ -810,18 +803,10 @@ export function FuseRegistrationManager({
               <Users className="w-3.5 h-3.5 inline mr-1" />
               {ticketCounts.guests} guests
             </span>
-            {ticketCounts.hallOfAime > 0 && (
-              <Badge className="bg-amber-100 text-amber-800">{ticketCounts.hallOfAime} Hall of AIME</Badge>
-            )}
-            {ticketCounts.wmnAtFuse > 0 && (
-              <Badge className="bg-pink-100 text-pink-800">{ticketCounts.wmnAtFuse} WMN</Badge>
-            )}
-            {ticketCounts.vettedVa > 0 && (
-              <Badge className="bg-emerald-100 text-emerald-800">{ticketCounts.vettedVa} Vetted VA</Badge>
-            )}
-            {ticketCounts.vipLuncheon > 0 && (
-              <Badge className="bg-purple-100 text-purple-800">{ticketCounts.vipLuncheon} VIP Luncheon</Badge>
-            )}
+            <Badge className="bg-amber-100 text-amber-800">{ticketCounts.hallOfAime} Hall of AIME</Badge>
+            <Badge className="bg-pink-100 text-pink-800">{ticketCounts.wmnAtFuse} WMN</Badge>
+            <Badge className="bg-emerald-100 text-emerald-800">{ticketCounts.vettedVa} Vetted VA</Badge>
+            <Badge className="bg-purple-100 text-purple-800">{ticketCounts.vipLuncheon} VIP Luncheon</Badge>
           </div>
         </div>
       )}

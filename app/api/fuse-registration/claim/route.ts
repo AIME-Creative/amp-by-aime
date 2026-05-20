@@ -229,11 +229,6 @@ export async function POST(request: NextRequest) {
         .eq('is_active', true)
       priceRows = rows ?? null
 
-      const { data: rules } = await supabase
-        .from('fuse_guest_pricing_rules')
-        .select('tier, base_product_key, discount_percent')
-        .eq('fuse_event_id', fuse_event_id)
-
       // Per-guest add-on gating: a guest can only opt into an add-on if
       // the main attendee is also selecting it in this same finalize.
       // VIP claims auto-include HOA on the registration (see isVipMemberClaim
@@ -253,7 +248,6 @@ export async function POST(request: NextRequest) {
 
       guestPlan = planGuestPricing({
         tier: (profile.plan_tier as string | null) ?? null,
-        rules: rules ?? null,
         prices: priceRows ?? null,
         existingIncludedCount: 0,
         existingGuestHoaIncludedCount: 0,
@@ -423,7 +417,11 @@ export async function POST(request: NextRequest) {
         tier: ['Premium', 'Elite', 'VIP'].includes(profile.plan_tier as string)
           ? profile.plan_tier
           : null,
-        purchase_type: isFreeClaim ? 'claimed' : 'purchased',
+        purchase_type: isFreeClaim
+          ? 'claimed'
+          : step === 'finalize'
+          ? 'purchased'
+          : 'pending',
         has_hall_of_aime: insertHoa,
         has_wmn_at_fuse: insertWmn,
         has_vetted_va: insertVettedVa,
@@ -518,7 +516,11 @@ export async function POST(request: NextRequest) {
           tier: ['Premium', 'Elite', 'VIP'].includes(profile.plan_tier as string)
             ? profile.plan_tier
             : null,
-          purchase_type: isFreeClaim ? 'claimed' : 'purchased',
+          purchase_type: isFreeClaim
+          ? 'claimed'
+          : step === 'finalize'
+          ? 'purchased'
+          : 'pending',
           has_hall_of_aime: insertHoa,
           has_wmn_at_fuse: insertWmn,
           has_vetted_va: insertVettedVa,

@@ -29,7 +29,7 @@ export default async function FuseRegistrationPage() {
   // Get user profile
   const { data: profile } = await supabase
     .from('profiles')
-    .select('id, email, full_name, phone, company, plan_tier, billing_period, fuse_ticket_claimed_year, gender, is_admin')
+    .select('id, email, full_name, phone, company, plan_tier, billing_period, subscription_override, fuse_ticket_claimed_year, gender, is_admin')
     .eq('id', effectiveUserId)
     .single()
 
@@ -61,7 +61,7 @@ export default async function FuseRegistrationPage() {
   // Eligibility: annual eligible tier (claim flow) OR monthly eligible
   // tier (buy flow). Anyone else bounces to /dashboard. Admins bypass
   // so they can preview either variant regardless of their own plan.
-  const eligibility = getFuseEligibility(profile.plan_tier, profile.billing_period)
+  const eligibility = getFuseEligibility(profile.plan_tier, profile.billing_period, profile.subscription_override)
   if (!isAdmin && eligibility.kind === 'none') {
     redirect('/dashboard')
   }
@@ -87,32 +87,10 @@ export default async function FuseRegistrationPage() {
     .eq('user_id', effectiveUserId)
     .single()
 
-  // Monthly buyer with no registration yet: auto-create a default GA
-  // reservation so they land directly on the unified checkout instead
-  // of a separate ticket-picker landing card. They can swap to GA Plus
-  // inline via the "Add Upgrade to Order" card.
-  if (!existingRegistration && eligibility.kind === 'buy') {
-    const { data: created } = await supabase
-      .from('fuse_registrations')
-      .insert({
-        fuse_event_id: activeEvent.id,
-        user_id: effectiveUserId,
-        full_name: profile.full_name ?? '',
-        email: profile.email,
-        phone: profile.phone ?? null,
-        company: profile.company ?? null,
-        ticket_type: 'general_admission',
-        tier: profile.plan_tier,
-        purchase_type: 'purchased',
-        step_completed: 'claim',
-        registration_source: 'dashboard_buy',
-      })
-      .select(
-        'id, ticket_type, purchase_type, has_hall_of_aime, has_wmn_at_fuse, has_vetted_va, has_vip_luncheon, step_completed, guests:fuse_registration_guests(id, full_name, ticket_type, is_included, has_hall_of_aime, has_wmn_at_fuse, has_vetted_va, has_vip_luncheon)',
-      )
-      .single()
-    existingRegistration = created
-  }
+  // Monthly buyers used to get a reservation row inserted here on page
+  // view, which polluted fuse_registrations with rows for anyone who
+  // merely opened the page. The buyer CTA on the landing card now
+  // creates the row on first deliberate click.
 
   // Fetch tier-specific prices + universal add-ons (tier IS NULL, like WMN)
   const effectiveTier = profile.plan_tier && eligibleTiers.includes(profile.plan_tier)
@@ -148,20 +126,14 @@ export default async function FuseRegistrationPage() {
     ...activePublicAddons.filter((a) => !tierProductKeys.includes(a.product_key)),
   ]
 
-  // Full price catalog + guest pricing rules for client-side order-summary math.
-  // planGuestPricing (used in OrderSummary) needs the regular public GA row to
-  // compute the member-discount base, which isn't always in `mergedPrices`.
+  // Full price catalog for client-side order-summary math (planGuestPricing
+  // looks up the static guest_ticket row, which isn't always in `mergedPrices`).
   const { data: allPriceRows } = await supabase
     .from('fuse_ticket_prices')
     .select('*')
     .eq('fuse_event_id', activeEvent.id)
     .eq('is_active', true)
     .order('sort_order')
-
-  const { data: guestPricingRules } = await supabase
-    .from('fuse_guest_pricing_rules')
-    .select('tier, base_product_key, discount_percent')
-    .eq('fuse_event_id', activeEvent.id)
 
   return (
     <FuseClaimPage
@@ -174,13 +146,13 @@ export default async function FuseRegistrationPage() {
         company: profile.company,
         plan_tier: profile.plan_tier,
         billing_period: profile.billing_period,
+        subscription_override: profile.subscription_override,
         gender: profile.gender,
       }}
       existingRegistration={existingRegistration}
       isAdmin={isAdmin}
       tierPrices={mergedPrices}
       allPrices={allPriceRows ?? []}
-      guestPricingRules={guestPricingRules ?? []}
     />
   )
 }

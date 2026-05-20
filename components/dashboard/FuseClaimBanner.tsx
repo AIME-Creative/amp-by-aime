@@ -8,6 +8,7 @@ import { getFuseEligibility } from '@/lib/fuse/eligibility'
 interface FuseClaimBannerProps {
   planTier?: PlanTier | string | null
   billingPeriod?: string | null
+  subscriptionOverride?: boolean | null
   fuseTicketClaimedYear?: number | null
   activeEventYear?: number
   eventName?: string
@@ -33,6 +34,7 @@ const BUY_SUBLINE = 'General Admission ticket available'
 export function FuseClaimBanner({
   planTier,
   billingPeriod,
+  subscriptionOverride,
   fuseTicketClaimedYear,
   activeEventYear = 2026,
   eventName,
@@ -48,7 +50,7 @@ export function FuseClaimBanner({
     return null
   }
 
-  const eligibility = getFuseEligibility(planTier, billingPeriod)
+  const eligibility = getFuseEligibility(planTier, billingPeriod, subscriptionOverride)
   // Admins always see the banner so they can preview / test the flow,
   // even if their own profile doesn't satisfy the live rules.
   if (eligibility.kind === 'none' && !isAdmin) {

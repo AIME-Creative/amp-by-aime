@@ -130,11 +130,6 @@ export async function POST(
       .eq('fuse_event_id', registration.fuse_event_id)
       .eq('is_active', true)
 
-    const { data: rules } = await supabase
-      .from('fuse_guest_pricing_rules')
-      .select('tier, base_product_key, discount_percent')
-      .eq('fuse_event_id', registration.fuse_event_id)
-
     const { data: eventRow } = await supabase
       .from('fuse_events')
       .select('year')
@@ -158,7 +153,6 @@ export async function POST(
     }))
     const guestPlan = planGuestPricing({
       tier: registration.tier ?? null,
-      rules: rules ?? null,
       prices: priceRows ?? null,
       existingIncludedCount: 0,
       existingGuestHoaIncludedCount: 0,
@@ -178,10 +172,13 @@ export async function POST(
     }
 
     // Monthly buyer finalizing a paid reservation: the registration
-    // row exists at step_completed='claim' with purchase_type='purchased',
-    // but the main GA ticket hasn't been charged yet.
+    // row exists at step_completed='claim' with purchase_type='pending'
+    // (legacy rows may still read 'purchased' if the migration didn't
+    // touch them), but the main GA ticket hasn't been charged yet.
     let mainTicketCents = 0
-    const isPaidReservation = registration.purchase_type === 'purchased'
+    const isPaidReservation =
+      registration.purchase_type === 'pending' ||
+      registration.purchase_type === 'purchased'
     if (isPaidReservation) {
       const mainPrice = pickActivePrice(priceRows, 'ga', null)
       mainTicketCents = (mainPrice?.price ?? 0) * 100
@@ -310,6 +307,14 @@ export async function POST(
 
     let writeFailed = false
 
+    // Payment just succeeded, so a 'pending' reservation becomes a real
+    // 'purchased' ticket. Hold the effective value locally so the GHL
+    // drop below sees the post-update state without re-reading the row.
+    const effectivePurchaseType =
+      registration.purchase_type === 'pending'
+        ? 'purchased'
+        : registration.purchase_type
+
     const regUpdate: Record<string, unknown> = {
       has_hall_of_aime,
       has_wmn_at_fuse,
@@ -318,6 +323,9 @@ export async function POST(
       marketing_consent,
       step_completed: 'finalized',
       updated_at: new Date().toISOString(),
+    }
+    if (registration.purchase_type === 'pending') {
+      regUpdate.purchase_type = 'purchased'
     }
 
     const { error: updateError } = await supabase
@@ -398,7 +406,7 @@ export async function POST(
     // skipped the claim drop (auto-reservation), so this is their
     // first push and rates as NEW.
     const finalizeDropEvent =
-      registration.purchase_type === 'claimed' ? 'update' : 'new'
+      effectivePurchaseType === 'claimed' ? 'update' : 'new'
     if (shouldDropFuseRegistration(isAdmin) && !writeFailed) {
       try {
         await dropFuseRegistration({
@@ -415,7 +423,7 @@ export async function POST(
           billing_period: effectiveProfile?.billing_period ?? null,
           ticket_type: registration.ticket_type,
           tier: registration.tier,
-          purchase_type: registration.purchase_type,
+          purchase_type: effectivePurchaseType,
           has_hall_of_aime,
           has_wmn_at_fuse,
           has_vetted_va,

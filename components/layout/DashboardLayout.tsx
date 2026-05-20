@@ -23,6 +23,7 @@ interface DashboardLayoutProps {
   subscriptionStatus?: string
   planTier?: string | null
   billingPeriod?: string | null
+  subscriptionOverride?: boolean | null
   fuseTicketClaimedYear?: number | null
   fuseActiveEventYear?: number
   fuseActiveEventEndDate?: string | null
@@ -43,6 +44,7 @@ export default function DashboardLayout({
   subscriptionStatus,
   planTier,
   billingPeriod,
+  subscriptionOverride,
   fuseTicketClaimedYear,
   fuseActiveEventYear,
   fuseActiveEventEndDate,
@@ -88,6 +90,7 @@ export default function DashboardLayout({
         <FuseClaimBanner
           planTier={planTier}
           billingPeriod={billingPeriod}
+          subscriptionOverride={subscriptionOverride}
           fuseTicketClaimedYear={fuseTicketClaimedYear}
           activeEventYear={fuseActiveEventYear}
           eventName={fuseEventName}

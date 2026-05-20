@@ -27,7 +27,7 @@ export default async function ClaimFuseTicketPage() {
 
   const { data: profile } = await supabase
     .from('profiles')
-    .select('plan_tier, billing_period, full_name, fuse_ticket_claimed_year, profile_complete, is_admin')
+    .select('plan_tier, billing_period, subscription_override, full_name, fuse_ticket_claimed_year, profile_complete, is_admin')
     .eq('id', user.id)
     .single()
 
@@ -47,6 +47,7 @@ export default async function ClaimFuseTicketPage() {
   const eligibility = getFuseEligibility(
     profile?.plan_tier,
     profile?.billing_period,
+    profile?.subscription_override,
   )
   const alreadyClaimed =
     !!activeEvent?.year &&

@@ -94,49 +94,11 @@ export function pickActivePrices<T extends PriceRow>(
     .filter((p): p is T => p !== null)
 }
 
-export interface GuestPricingRule {
-  tier: string
-  base_product_key: string
-  discount_percent: number
-}
-
-/**
- * Compute the discounted price (in whole dollars, may be fractional) a
- * member of `tier` pays for a guest ticket. The base is the *regular*
- * price of `baseProductKey` (GA regular by default) per spec: "Discount
- * taken off of regular price, not early bird."
- *
- * Returns null if no matching rule or base price row exists. Caller is
- * responsible for converting to cents for Stripe (`Math.round(value * 100)`)
- * and for display formatting.
- */
-export function computeGuestPrice<T extends PriceRow>(
-  rules: GuestPricingRule[] | null | undefined,
-  prices: T[] | null | undefined,
-  tier: string,
-  baseProductKey: string = 'ga',
-): number | null {
-  if (!rules || !prices) return null
-  const rule = rules.find(
-    (r) => r.tier === tier && r.base_product_key === baseProductKey,
-  )
-  if (!rule) return null
-  const basePrice = prices.find(
-    (p) =>
-      p.product_key === baseProductKey &&
-      (p.tier ?? null) === null &&
-      p.pricing_phase === 'regular' &&
-      p.is_active !== false,
-  )
-  if (!basePrice || basePrice.price == null) return null
-  return basePrice.price * (1 - rule.discount_percent / 100)
-}
-
 // ----------------------------------------------------------------
 // Guest pricing plan: applies VIP first-guest-included entitlement
-// and tier-discounted prices for additional guests. Used by both
-// the finalize and the top-up endpoints so member guest pricing is
-// consistent across both code paths.
+// and the static `guest_ticket` catalog price for every paid guest.
+// Used by finalize, top-up, claim, and admin checkout so member and
+// public flows stay consistent.
 // ----------------------------------------------------------------
 
 export interface GuestInsertRecord {
@@ -152,7 +114,7 @@ export interface GuestInsertRecord {
 export interface GuestStripeLineItem {
   /** Set when the line uses a pre-made Stripe Price object. */
   price?: string
-  /** Set when the line is an ad-hoc tier-discounted price for this guest. */
+  /** Set as a fallback when the catalog row has no stripe_price_id. */
   price_data?: {
     currency: 'usd'
     product_data: { name: string }
@@ -165,7 +127,7 @@ export interface GuestDisplayLineItem {
   label: string
   /** 'included' renders as "Included", 0 renders as "Free", otherwise "$X.XX". */
   amountCents: number | 'included'
-  /** Optional subtitle below the label (e.g., "Premium member rate"). */
+  /** Optional subtitle below the label (e.g., "Included with VIP membership"). */
   hint?: string
 }
 
@@ -182,13 +144,10 @@ export interface GuestPricingPlan {
  * Build the insert records + Stripe line items for a batch of new guests
  * on a registration.
  *
- * Tier rules (per spec):
+ * Rules:
  *  - VIP: 1 included guest per registration (lifetime, not per-batch).
- *    Beyond that, computeGuestPrice('VIP') applies (30% off regular GA).
- *  - Premium / Elite: no included guest; computeGuestPrice(tier) applies
- *    to every guest (10% / 20% off regular GA respectively).
- *  - No tier (public / admin without tier): full public GA price using
- *    the phase-active Stripe price id.
+ *    Beyond that, the static `guest_ticket` catalog price applies.
+ *  - Every other guest (member or public): static `guest_ticket` price.
  */
 export interface GuestAddonFlags {
   has_hall_of_aime?: boolean
@@ -199,7 +158,6 @@ export interface GuestAddonFlags {
 
 export function planGuestPricing<T extends PriceRow>(args: {
   tier: string | null
-  rules: GuestPricingRule[] | null | undefined
   prices: T[] | null | undefined
   /** Count of guests already on this registration with is_included = true. */
   existingIncludedCount: number
@@ -226,7 +184,6 @@ export function planGuestPricing<T extends PriceRow>(args: {
 }): GuestPricingPlan {
   const {
     tier,
-    rules,
     prices,
     existingIncludedCount,
     existingGuestHoaIncludedCount = 0,
@@ -239,26 +196,13 @@ export function planGuestPricing<T extends PriceRow>(args: {
   const displayLineItems: GuestDisplayLineItem[] = []
   let totalCents = 0
 
-  // Normalize: empty strings / 'None' / anything not in the member set
-  // counts as no-tier and gets the public price path. Without this,
-  // an empty-string tier on the admin / unset-profile case falls through
-  // both branches and silently produces $0.
-  const memberTiers = ['Premium', 'Elite', 'VIP']
-  const isMemberTier = !!tier && memberTiers.includes(tier)
-
   // VIP first-guest-included entitlement: only the first VIP-tier guest
   // (across all submissions) gets is_included = true.
   let vipIncludedRemaining =
     tier === 'VIP' ? Math.max(0, 1 - existingIncludedCount) : 0
 
-  // Per-tier paid guest pricing (member tiers).
-  const memberPriceDollars = isMemberTier
-    ? computeGuestPrice(rules, prices, tier as string, 'ga')
-    : null
-
-  // Public GA active price row for the no-tier path (anything not a
-  // member tier — null, undefined, empty string, unrecognized).
-  const publicGa = !isMemberTier ? pickActivePrice(prices, 'ga', null) : null
+  // Static guest ticket price — same for every paid guest, all tiers.
+  const guestTicket = pickActivePrice(prices, 'guest_ticket', null)
 
   // HOA pricing: same active-phase price the main attendee pays. Per
   // spec, member discounts apply to guest TICKETS only, not add-ons —
@@ -332,7 +276,11 @@ export function planGuestPricing<T extends PriceRow>(args: {
 
     if (vipIncludedRemaining > 0) {
       vipIncludedRemaining -= 1
-      pushGuestRecord(g.ticket_type || 'vip_guest', true)
+      // This branch only fires when tier === 'VIP' (see
+      // vipIncludedRemaining computation above), so the included slot is
+      // always a VIP ticket. Force 'vip' to keep stored ticket_type
+      // truthful regardless of what the client sent.
+      pushGuestRecord('vip', true)
       displayLineItems.push({
         label: `Guest: ${name}`,
         amountCents: 'included',
@@ -342,36 +290,20 @@ export function planGuestPricing<T extends PriceRow>(args: {
       continue
     }
 
-    pushGuestRecord(g.ticket_type || 'general_admission', false)
+    // Paid-guest branch: every non-included guest is charged the static
+    // guest_ticket price regardless of the client-supplied ticket_type.
+    // The VIP plan only grants ONE free VIP guest slot — that's handled
+    // above by the vipIncludedRemaining branch. So force the stored
+    // ticket_type to 'general_admission' here even if the client sent
+    // 'vip' (which it does for VIP plan members so the first guest's
+    // record reflects the included VIP slot).
+    pushGuestRecord('general_admission', false)
 
-    if (memberPriceDollars != null) {
-      const tierLabel = tier ?? 'Member'
-      const cents = Math.round(memberPriceDollars * 100)
-      stripeLineItems.push({
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: `${eventLabel} Guest Ticket (${tierLabel} member rate)`,
-          },
-          unit_amount: cents,
-        },
-        quantity: 1,
-      })
-      totalCents += cents
-      displayLineItems.push({
-        label: `Guest: ${name}`,
-        amountCents: cents,
-        hint: `${tierLabel} member rate`,
-      })
-    } else if (!isMemberTier && publicGa) {
-      // Public / no-tier path. Always emit the display line + total from
-      // the `price` column so the UI never silently shows $0. For Stripe,
-      // prefer a pre-made price id when seeded, else fall back to ad-hoc
-      // price_data using the same dollar amount.
-      const cents = (publicGa.price ?? 0) * 100
-      if (publicGa.stripe_price_id) {
+    if (guestTicket) {
+      const cents = (guestTicket.price ?? 0) * 100
+      if (guestTicket.stripe_price_id) {
         stripeLineItems.push({
-          price: publicGa.stripe_price_id,
+          price: guestTicket.stripe_price_id,
           quantity: 1,
         })
       } else if (cents > 0) {
