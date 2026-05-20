@@ -22,6 +22,7 @@ import type { WorkOptions } from 'pg-boss';
 import { handleSubscriptionLifecycle } from './handlers/subscription-lifecycle';
 import { handleInvoicePayment } from './handlers/invoice-payment';
 import { handleChargeRefund } from './handlers/charge-refund';
+import { handleProfileGhlSync } from './handlers/profile-ghl-sync';
 
 const SHUTDOWN_GRACE_MS = 15_000;
 
@@ -69,6 +70,13 @@ async function main(): Promise<void> {
   await boss.createQueue(dlqOf(QUEUE_NAMES.stripeInvoicePayment), baseRetention);
   await boss.createQueue(QUEUE_NAMES.stripeChargeRefund, baseRetention);
   await boss.createQueue(dlqOf(QUEUE_NAMES.stripeChargeRefund), baseRetention);
+  // AIME-15: per-profile FIFO so rapid successive updates to the same
+  // profile reach GHL in enqueue order (singletonKey=profile_id at send).
+  await boss.createQueue(QUEUE_NAMES.appProfileGhlUpsert, {
+    ...baseRetention,
+    policy: 'key_strict_fifo',
+  });
+  await boss.createQueue(dlqOf(QUEUE_NAMES.appProfileGhlUpsert), baseRetention);
   log('queues created');
 
   // Each queue runs with conservative concurrency (10 in-flight per
@@ -89,6 +97,7 @@ async function main(): Promise<void> {
     handleInvoicePayment,
   );
   await boss.work(QUEUE_NAMES.stripeChargeRefund, opts, handleChargeRefund);
+  await boss.work(QUEUE_NAMES.appProfileGhlUpsert, opts, handleProfileGhlSync);
 
   // DLQ queues exist so they're visible to operators in pgboss.queue
   // and so retention policies apply. We don't register handlers —

@@ -38,6 +38,8 @@ export const QUEUE_NAMES = {
   stripeSubscriptionLifecycle: 'sync.stripe.subscription-lifecycle',
   stripeInvoicePayment: 'sync.stripe.invoice-payment',
   stripeChargeRefund: 'sync.stripe.charge-refund',
+  // AIME-15: profile change → GHL contact upsert.
+  appProfileGhlUpsert: 'sync.app.profile-ghl-upsert',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
